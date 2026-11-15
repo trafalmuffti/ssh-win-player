@@ -9,6 +9,7 @@
 #include <windows.h>
 #include <atomic>
 #include <cstdint>
+#include <functional>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -53,6 +54,18 @@ public:
     bool size(const std::string& path, int64_t& sz, std::string& err);
     // off must be a multiple of kBlock.  Returns bytes read (0 = EOF), or -1.
     int64_t read(const std::string& path, int64_t off, int64_t len, char* buf);
+
+    // Pipelined block reads: keeps up to `depth` requests of `len` bytes in
+    // flight so a distant server is not limited to one block per round trip.
+    // next() returns the next offset to request (a multiple of kBlock) or -1;
+    // done(off, data, n) is called for each answer in request order (n = -1 if
+    // the server reported an error for that block).  At most maxRequests are
+    // sent per call so other streams get a turn on the connection.
+    // Returns 1 on success, 0 if a block failed on the server, -1 on I/O error.
+    int readPipelined(const std::string& path, int64_t len, int depth, int maxRequests,
+                      const std::function<int64_t()>& next,
+                      const std::function<void(int64_t, const char*, int64_t)>& done);
+    bool isEnabled() const { return enabled_; }
 
     std::string lastStderr();
 

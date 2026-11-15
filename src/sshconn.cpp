@@ -2,6 +2,7 @@
 
 #include <cstdio>
 #include <cstring>
+#include <deque>
 
 // ---------------------------------------------------------------------------
 // Small helpers
@@ -435,4 +436,54 @@ int64_t SshConn::read(const std::string& path, int64_t off, int64_t len, char* b
         return 1;
     }, err);
     return ok ? result : -1;
+}
+
+int SshConn::readPipelined(const std::string& path, int64_t len, int depth, int maxRequests,
+                           const std::function<int64_t()>& next,
+                           const std::function<void(int64_t, const char*, int64_t)>& done) {
+    if (!ValidPath(path) || len <= 0 || len % kBlock) return -1;
+    std::lock_guard<std::mutex> lk(mtx_);
+    if (!aliveLocked()) {
+        stopLocked();
+        if (!enabled_) return -1;
+        std::string err;
+        if (!startLocked(err)) return -1;
+    }
+    std::vector<char> buf((size_t)len);
+    std::deque<int64_t> queue;
+    int sent = 0, result = 1;
+    auto send = [&](int64_t off) {
+        char req[64];
+        snprintf(req, sizeof(req), "R\n%lld %lld\n", (long long)off, (long long)len);
+        return writeAll(req + path + "\n");
+    };
+    auto fill = [&]() -> bool {
+        while ((int)queue.size() < depth && sent < maxRequests) {
+            int64_t off = next();
+            if (off < 0 || off % kBlock) break;
+            if (!send(off)) return false;
+            queue.push_back(off);
+            ++sent;
+        }
+        return true;
+    };
+    if (!fill()) { stopLocked(); return -1; }
+    while (!queue.empty()) {
+        int64_t off = queue.front();
+        queue.pop_front();
+        std::string l;
+        if (!readLine(l)) { stopLocked(); return -1; }
+        if (l == "ERR") {
+            result = 0;
+            done(off, nullptr, -1);
+        } else {
+            if (l.compare(0, 3, "OK ") != 0) { stopLocked(); return -1; }
+            int64_t n = _strtoi64(l.c_str() + 3, nullptr, 10);
+            if (n < 0 || n > len) { stopLocked(); return -1; }
+            if (n && !readExact(buf.data(), (size_t)n)) { stopLocked(); return -1; }
+            done(off, buf.data(), n);
+        }
+        if (result == 1 && !fill()) { stopLocked(); return -1; }
+    }
+    return result;
 }

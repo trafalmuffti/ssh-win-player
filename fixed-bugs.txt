@@ -18,3 +18,18 @@ Fixed bugs
 
 2026-11-15  Size column clipped values like "156.8 KB"
   Fix:     widened the Size column.
+
+2026-11-15  Buffering / stalls on far-away (high-latency) connections
+  Symptom: on distant servers playback stalled, and after a seek the picture froze for
+           several seconds (300 ms RTT test: ~6 s freeze after a +30 s seek).
+  Cause:   remote data was fetched one block per round trip, only when mpv asked for it
+           (strict request/response, chunks restarting at 256 KiB after every seek), so
+           throughput was capped by latency and nothing was buffered around the position.
+  Fix:     each remote stream now has a background prefetch thread and a block cache that
+           keeps 5 s before and 5 s after the read position (size/duration estimate, 2-96 MiB),
+           fetched with pipelined requests (8-32 x 256 KiB in flight, SshConn::readPipelined),
+           current block first, then a little ahead, then the 5 s behind, then the rest ahead.
+           mpv: cache-pause-initial (start once 5 s are buffered), cache-pause-wait=5 (resume
+           after a stall with 5 s buffered), demuxer-seekable-cache=yes (instant seeks back).
+           Result in the same test: playback resumed 0.24 s after the seek, no stalls.
+           Pipelining alone: 5.5 -> 11.5 MiB/s at 150 ms RTT.
