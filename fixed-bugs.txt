@@ -1,0 +1,20 @@
+Fixed bugs
+==========
+
+2026-11-15  Path box kept a mistyped path after a failed navigation
+  Symptom: typing a non-existent folder and pressing Enter left the bad text in the
+           path box although the list still showed the old folder.
+  Fix:     NavigateRemote/NavigateLocal restore the current folder (UpdatePathBox) on failure.
+
+2026-11-15  External subtitles from the remote folder were loaded but not shown
+  Symptom: "Movie.srt" next to "Movie.mkv" on the server was added but stayed disabled.
+  Cause:   sub-add was called with the "auto" flag, which means "do not select".
+  Fix:     the first matching subtitle is added with "select", others with "auto".
+
+2026-11-15  Wheel / arrow seeks jumped by much more than 5 s
+  Symptom: one wheel notch moved from 0:03 to 0:10 on files with sparse keyframes.
+  Cause:   mpv relative seeks snap to keyframes by default.
+  Fix:     hr-seek=yes (precise seeks).
+
+2026-11-15  Size column clipped values like "156.8 KB"
+  Fix:     widened the Size column.
