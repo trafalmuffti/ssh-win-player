@@ -47,7 +47,7 @@ static const double kWheelSeekShift = 30.0; // with Shift held
 enum {
     IDC_HOST_LBL = 100, IDC_HOST, IDC_PORT_LBL, IDC_PORT, IDC_PASS_LBL, IDC_PASS, IDC_KEY_LBL, IDC_KEY,
     IDC_KEYBROWSE, IDC_CONNECT, IDC_LOCAL,
-    IDC_UP, IDC_REFRESH, IDC_PATH, IDC_ALLFILES, IDC_LIST,
+    IDC_UP, IDC_HOME, IDC_REFRESH, IDC_PATH, IDC_ALLFILES, IDC_LIST,
     IDC_SEEK, IDC_TIME, IDC_STATUS, IDC_VIDEO,
     // player buttons (keep contiguous)
     IDC_BTN_FIRST,
@@ -63,7 +63,7 @@ enum {
 // ---------------------------------------------------------------------------
 static HINSTANCE g_inst;
 static HWND g_main, g_video, g_list, g_path, g_seek, g_time, g_status, g_tooltip;
-static HWND g_host, g_port, g_pass, g_key, g_connectBtn, g_localBtn, g_allFiles, g_upBtn, g_refreshBtn;
+static HWND g_host, g_port, g_pass, g_key, g_connectBtn, g_localBtn, g_allFiles, g_upBtn, g_homeBtn, g_refreshBtn;
 static HWND g_lblHost, g_lblPort, g_lblPass, g_lblKey, g_keyBrowse;
 static HWND g_btn[IDC_BTN_LAST - IDC_BTN_FIRST];
 static HFONT g_font, g_symFont, g_bigFont;
@@ -79,6 +79,10 @@ static mpv_handle* g_mpvh = nullptr;
 static SshConn g_browseConn;  // directory listings (UI thread)
 static SshConn g_streamConn;  // file data (mpv threads)
 static bool g_connected = false;
+static bool g_remoteIsUnix = false;   // server has uname
+static std::string g_remoteHome;      // "~" of the remote user (Unix servers)
+static std::wstring g_remoteOs;       // uname -s, e.g. "Linux"
+static const wchar_t* kHotkeyHelpUrl = L"https://mpv.io/manual/stable/#keyboard-control";
 static std::wstring g_connLabel;
 
 // Player state mirrored from mpv properties.
@@ -256,8 +260,14 @@ static std::wstring FormatSize(int64_t sz) {
 
 static void SetStatus(const std::wstring& s) { SendMessageW(g_status, SB_SETTEXTW, 0, (LPARAM)s.c_str()); }
 static void SetConnStatus() {
-    std::wstring s = g_connected ? (L"Connected: " + g_connLabel) : L"Not connected";
+    std::wstring s = g_connected ? (L"Connected: " + g_connLabel + (g_remoteOs.empty() ? L"" : L"  (" + g_remoteOs + L")"))
+                                 : L"Not connected";
     SendMessageW(g_status, SB_SETTEXTW, 1, (LPARAM)s.c_str());
+}
+
+// F1: open the mpv keyboard reference in the default browser.
+static void OpenHotkeyHelp() {
+    ShellExecuteW(nullptr, L"open", kHotkeyHelpUrl, nullptr, nullptr, SW_SHOWNORMAL);
 }
 
 // ---------------------------------------------------------------------------
@@ -576,6 +586,8 @@ static const char* kBindings =
     "CLOSE_WIN script-message swp-stop\n"
     "POWER ignore\n"
     "STOP script-message swp-stop\n"
+    // F1: mpv keyboard reference in the default browser.
+    "F1 script-message swp-help\n"
     // Playlist keys use the app's playlist (the files of the folder).
     "> script-message swp-next\n"
     "< script-message swp-prev\n"
@@ -889,6 +901,7 @@ static void HandleMpvEvents() {
                 if (a == "swp-next") { if (g_plIndex + 1 < (int)g_playlist.size()) PlayIndex(g_plIndex + 1); }
                 else if (a == "swp-prev") { if (g_plIndex > 0) PlayIndex(g_plIndex - 1); }
                 else if (a == "swp-stop") StopPlayback();
+                else if (a == "swp-help") OpenHotkeyHelp();
             }
             break;
         }
@@ -997,7 +1010,7 @@ static void Layout() {
     vis(g_seek, !fs);
     vis(g_time, !fs);
     bool listVis = !fs && g_showList;
-    for (HWND h : {g_upBtn, g_refreshBtn, g_path, g_allFiles, g_list}) vis(h, listVis);
+    for (HWND h : {g_upBtn, g_homeBtn, g_refreshBtn, g_path, g_allFiles, g_list}) vis(h, listVis);
 
     if (fs) {
         MoveWindow(g_video, 0, 0, W, H, TRUE);
@@ -1039,8 +1052,9 @@ static void Layout() {
         int lw = std::max(S(150), std::min(g_listW, W - S(250)));
         int lx = pad, ly = top;
         MoveWindow(g_upBtn, lx, ly, S(30), rowH, TRUE);
-        MoveWindow(g_refreshBtn, lx + S(30) + gap, ly, S(30), rowH, TRUE);
-        int px = lx + 2 * (S(30) + gap);
+        MoveWindow(g_homeBtn, lx + S(30) + gap, ly, S(30), rowH, TRUE);
+        MoveWindow(g_refreshBtn, lx + 2 * (S(30) + gap), ly, S(30), rowH, TRUE);
+        int px = lx + 3 * (S(30) + gap);
         MoveWindow(g_path, px, ly, lw - (px - lx), rowH, TRUE);
         ly += rowH + gap;
         MoveWindow(g_allFiles, lx, ly, lw, S(20), TRUE);
@@ -1325,6 +1339,21 @@ static void Refresh() {
     else NavigateLocal(g_localPath, name);
 }
 
+// Home button: the Windows user folder locally; on a Unix server (uname
+// exists) the remote user's home (~).  Servers without uname go to "/".
+static void GoHome() {
+    if (g_mode == Mode::Remote && g_connected) {
+        if (g_remoteIsUnix && !g_remoteHome.empty()) { NavigateRemote(g_remoteHome); return; }
+        std::string home, e;
+        if (g_remoteIsUnix && g_browseConn.home(home, e)) { g_remoteHome = home; NavigateRemote(home); return; }
+        NavigateRemote("/");
+        return;
+    }
+    wchar_t b[MAX_PATH];
+    if (SUCCEEDED(SHGetFolderPathW(nullptr, CSIDL_PROFILE, nullptr, 0, b))) NavigateLocal(b);
+    else NavigateLocal(L"");
+}
+
 static void PlayFromListing(int entryIdx) {
     const Entry& sel = g_entries[entryIdx];
     std::wstring dirKey = CurrentDirKey();
@@ -1399,6 +1428,9 @@ static void Disconnect() {
     g_streamConn.disconnect();
     g_browseConn.disconnect();
     g_connected = false;
+    g_remoteIsUnix = false;
+    g_remoteHome.clear();
+    g_remoteOs.clear();
     SetWindowTextW(g_connectBtn, L"Connect");
     SetConnStatus();
     if (g_mode == Mode::Remote) NavigateLocal(g_localPath);
@@ -1438,17 +1470,25 @@ static void Connect() {
     }
     g_connected = true;
     g_connLabel = p.dest + (p.port.empty() ? L"" : (L":" + p.port));
+    // uname present => probably a Unix system: Home goes to the user's ~.
+    {
+        std::string os, e;
+        bool hasUname = false;
+        g_browseConn.systemName(os, hasUname, e);
+        g_remoteIsUnix = hasUname;
+        g_remoteOs = Utf8ToWide(os);
+        g_remoteHome.clear();
+        if (g_remoteIsUnix && !g_browseConn.home(g_remoteHome, e)) g_remoteHome.clear();
+        AppLog("remote system: " + (hasUname ? (os.empty() ? std::string("unix") : os) : std::string("no uname")) +
+               ", home: " + (g_remoteHome.empty() ? std::string("-") : g_remoteHome));
+    }
     SetWindowTextW(g_connectBtn, L"Disconnect");
     SetConnStatus();
     // Warm up the streaming connection in the background.
     std::thread([]() { std::string e; g_streamConn.connect(e); }).detach();
 
     std::wstring last = IniGet(L"paths", g_connLabel.c_str());
-    if (last.empty() || !NavigateRemote(WideToUtf8(last))) {
-        std::string home, e2;
-        if (g_browseConn.home(home, e2)) NavigateRemote(home);
-        else NavigateRemote("/");
-    }
+    if (last.empty() || !NavigateRemote(WideToUtf8(last))) GoHome();
 }
 
 // ---------------------------------------------------------------------------
@@ -1505,6 +1545,7 @@ static bool ForwardKeyDown(UINT vk, LPARAM lp) {
         vk == VK_CAPITAL || vk == VK_NUMLOCK || vk == VK_SCROLL)
         return false;
     if (vk == VK_VOLUME_UP || vk == VK_VOLUME_DOWN || vk == VK_VOLUME_MUTE) return false;  // system volume
+    if (vk == VK_F1 && !ctrl && !alt && !shift) { OpenHotkeyHelp(); return true; }
     if (ctrl && vk == 'O') { SendMessageW(g_main, WM_COMMAND, IDC_BTN_OPEN, 0); return true; }
     if (ctrl && vk == 'L') { SetFocus(g_path); SendMessageW(g_path, EM_SETSEL, 0, -1); return true; }
     std::string name = VkName(vk, (lp & (1 << 24)) != 0);
@@ -1648,7 +1689,7 @@ static LRESULT CALLBACK VideoProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                 L"Connect to a server (or use Local files) and double-click a video or audio file.\n"
                 L"You can also drop files here.\n\n"
                 L"Mouse wheel: seek \u00B15 s (Shift: \u00B130 s)  \u2022  mpv hotkeys work  \u2022  "
-                L"Double-click / f: fullscreen";
+                L"Double-click / f: fullscreen  \u2022  F1: list of hotkeys";
             RECT tr = rc;
             InflateRect(&tr, -S(20), -S(20));
             RECT calc = tr;
@@ -1724,6 +1765,8 @@ static void CreateControls() {
 
     g_upBtn = MakeCtl(L"BUTTON", L"\u2191", 0, IDC_UP);
     SendMessageW(g_upBtn, WM_SETFONT, (WPARAM)g_symFont, TRUE);
+    g_homeBtn = MakeCtl(L"BUTTON", L"\u2302", 0, IDC_HOME);
+    SendMessageW(g_homeBtn, WM_SETFONT, (WPARAM)g_symFont, TRUE);
     g_refreshBtn = MakeCtl(L"BUTTON", L"\u27F3", 0, IDC_REFRESH);
     SendMessageW(g_refreshBtn, WM_SETFONT, (WPARAM)g_symFont, TRUE);
     g_path = MakeCtl(L"EDIT", L"", ES_AUTOHSCROLL, IDC_PATH, WS_EX_CLIENTEDGE);
@@ -1808,6 +1851,7 @@ static void CreateControls() {
     AddTip(g_keyBrowse, L"Choose a private key file");
     AddTip(g_upBtn, L"Parent folder  ( Backspace )");
     AddTip(g_refreshBtn, L"Refresh");
+    AddTip(g_homeBtn, L"Home folder: your Windows user folder, or ~ on the server when connected");
     AddTip(g_localBtn, L"Switch between this PC and the remote server");
     AddTip(g_seek, L"Click or drag to seek; mouse wheel seeks \u00B15 s");
 
@@ -1865,6 +1909,7 @@ static void OnCommand(int id, int code) {
     }
     case IDC_UP: GoUp(); break;
     case IDC_REFRESH: Refresh(); break;
+    case IDC_HOME: GoHome(); break;
     case IDC_ALLFILES:
         if (code == BN_CLICKED) {
             IniSet(L"main", L"showAll", SendMessageW(g_allFiles, BM_GETCHECK, 0, 0) == BST_CHECKED ? L"1" : L"0");

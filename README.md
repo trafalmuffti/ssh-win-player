@@ -26,7 +26,7 @@ its media files with **libmpv**, without copying the files first. It also plays 
    - **Keys / ssh-agent** (recommended): leave the password empty. Keys in `%USERPROFILE%\.ssh`
      and the Windows `ssh-agent` service work, as does a key file chosen with **Key**.
    - **Password**: type it in the Password box (also used as key passphrase). It is never saved.
-3. Click **Connect**, browse folders (double-click / Enter, Backspace = up) and double-click a file.
+3. Click **Connect** (the server's system is detected with `uname` and shown in the status bar), browse folders (double-click / Enter, Backspace = up) and double-click a file.
    The other media files of that folder become the playlist (Next/Previous, auto-advance).
 4. **Local files** switches to this PC's drives; you can also drop files on the window,
    use **Open...** (Ctrl+O), or pass files on the command line.
@@ -50,6 +50,8 @@ host key is refused.
 | Loop | loop current file | `L` |
 | Fullscreen | toggle | `f`, double click, Esc leaves |
 | ☰ | show / hide the file browser | |
+| ⌂ (above the file list) | home folder: your Windows user folder; when connected to a Unix server (detected by `uname`), your home `~` there | |
+| | mpv keyboard reference in your web browser | `F1` |
 
 - **Mouse wheel** over the video, seek bar or controls: up = forward 5 s, down = back 5 s
   (hold **Shift** for 30 s).

@@ -61,6 +61,7 @@ static std::wstring QuoteArg(const std::wstring& a) {
 // The remote command loop.  POSIX sh, works with dash/bash/busybox/BSD sh.
 // Requests (one field per line):
 //   P                 -> OK \n <home dir>
+//   U                 -> OK <uname -s>  | ERR (no uname: probably not Unix)
 //   L \n path         -> OK \n <real path> \n entries... \n //END//   | ERR
 //                        entry = <size>:<type>:<name>  (size -1 = unknown;
 //                        type d / directory / Directory = folder)
@@ -81,6 +82,7 @@ static const char* kRemoteScript =
     "while IFS= read -r c; do\n"
     "case \"$c\" in\n"
     "P) cd 2>/dev/null; printf 'OK\\n%s\\n' \"$(pwd -P)\";;\n"
+    "U) if command -v uname >/dev/null 2>&1; then printf 'OK %s\\n' \"$(uname -s 2>/dev/null)\"; else echo ERR; fi;;\n"
     "L) IFS= read -r p; if cd \"$p\" 2>/dev/null; then printf 'OK\\n%s\\n' \"$(pwd -P)\";"
     " lsm; echo '//END//'; else echo ERR; fi;;\n"
     "S) IFS= read -r p; s=''; [ -f \"$p\" ] && [ -r \"$p\" ] && s=$(sz \"$p\" </dev/null);"
@@ -393,6 +395,20 @@ static bool ParseEntry(const std::string& l, RemoteEntry& e) {
 }
 
 static bool ValidPath(const std::string& p) { return p.find('\n') == std::string::npos && !p.empty(); }
+
+bool SshConn::systemName(std::string& os, bool& hasUname, std::string& err) {
+    hasUname = false;
+    os.clear();
+    return withRetry([&]() -> int {
+        std::string l;
+        if (!writeAll("U\n") || !readLine(l)) return -1;
+        if (l == "ERR") return 1;
+        if (l.compare(0, 2, "OK") != 0) return -1;
+        hasUname = true;
+        os = l.size() > 3 ? l.substr(3) : "";
+        return 1;
+    }, err);
+}
 
 bool SshConn::home(std::string& path, std::string& err) {
     return withRetry([&]() -> int {
