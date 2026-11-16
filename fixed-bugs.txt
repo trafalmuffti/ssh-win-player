@@ -50,3 +50,14 @@ Fixed bugs
            string, so only the first wide character was printed. The 2026-11-15 entry
            "Size column clipped values" misdiagnosed this as column width.
   Fix:     use %ls (wide string) in FormatSize.
+
+2026-11-16  No way to pick a specific subtitle / audio track
+  Symptom: the Subs and Audio buttons could only cycle through tracks one by one, which is
+           slow on files with many tracks and gives no idea what each track is.
+  Cause:   missing feature (buttons were plain "cycle sub" / "cycle audio").
+  Fix:     holding the Subs or Audio button for 0.4 s (or right-clicking it) opens a drop-down
+           list of the first 20 tracks from mpv's track-list (id, title, language, codec,
+           external/default), the current one ticked; Subs also offers "Off". Hold-drag-release
+           or click selects (sets sid/aid). A selected track beyond the first 20 is still shown,
+           ticked, below them; a "... N more" line says how many are hidden. Short click still
+           cycles. '&' in titles is escaped so it is not eaten as a menu accelerator.

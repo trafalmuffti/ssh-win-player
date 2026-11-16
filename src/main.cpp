@@ -586,6 +586,156 @@ static const char* kBindings =
 static void UpdateUiFromState();
 static bool g_buffering = false;
 
+// Tracks of the current file (from mpv's "track-list"), for the Subs / Audio menus.
+struct Track {
+    int64_t id = 0;
+    std::string type;  // "video", "audio", "sub"
+    std::wstring title, lang, codec;
+    bool selected = false, external = false, isDefault = false;
+};
+static std::vector<Track> g_tracks;
+static const int kMaxTrackMenu = 20;
+
+static const mpv_node* NodeGet(const mpv_node* map, const char* key) {
+    if (!map || map->format != MPV_FORMAT_NODE_MAP) return nullptr;
+    for (int i = 0; i < map->u.list->num; ++i)
+        if (strcmp(map->u.list->keys[i], key) == 0) return &map->u.list->values[i];
+    return nullptr;
+}
+static std::wstring NodeStr(const mpv_node* m, const char* key) {
+    const mpv_node* n = NodeGet(m, key);
+    return n && n->format == MPV_FORMAT_STRING ? Utf8ToWide(n->u.string) : L"";
+}
+static bool NodeFlag(const mpv_node* m, const char* key) {
+    const mpv_node* n = NodeGet(m, key);
+    return n && n->format == MPV_FORMAT_FLAG && n->u.flag;
+}
+
+static void ParseTrackList(const mpv_node* arr) {
+    g_tracks.clear();
+    if (!arr || arr->format != MPV_FORMAT_NODE_ARRAY) return;
+    for (int i = 0; i < arr->u.list->num; ++i) {
+        const mpv_node* t = &arr->u.list->values[i];
+        const mpv_node* id = NodeGet(t, "id");
+        const mpv_node* type = NodeGet(t, "type");
+        if (!id || id->format != MPV_FORMAT_INT64 || !type || type->format != MPV_FORMAT_STRING) continue;
+        Track tr;
+        tr.id = id->u.int64;
+        tr.type = type->u.string;
+        tr.title = NodeStr(t, "title");
+        tr.lang = NodeStr(t, "lang");
+        tr.codec = NodeStr(t, "codec");
+        tr.selected = NodeFlag(t, "selected");
+        tr.external = NodeFlag(t, "external");
+        tr.isDefault = NodeFlag(t, "default");
+        g_tracks.push_back(std::move(tr));
+    }
+}
+
+static std::wstring TrackLabel(const Track& t) {
+    std::wstring s = std::to_wstring(t.id) + L":  ";
+    std::wstring title = t.title;
+    if (title.empty()) title = t.lang.empty() ? L"Track " + std::to_wstring(t.id) : L"";
+    s += title;
+    if (!t.lang.empty()) s += (title.empty() ? L"" : L"  ") + std::wstring(L"[") + t.lang + L"]";
+    std::wstring extra;
+    if (!t.codec.empty()) extra += t.codec;
+    if (t.external) extra += extra.empty() ? L"external" : L", external";
+    if (t.isDefault) extra += extra.empty() ? L"default" : L", default";
+    if (!extra.empty()) s += L"  (" + extra + L")";
+    for (size_t i = 0; i < s.size(); ++i)  // '&' would become a menu accelerator
+        if (s[i] == L'&') { s.insert(i, 1, L'&'); ++i; }
+    return s;
+}
+
+// Drop-down list of the first 20 subtitle or audio tracks under the button.
+// Shown when the button is held down (or right-clicked).  If the mouse
+// button is still held, releasing it over an item selects that item.
+static void ShowTrackMenu(HWND button, bool subs) {
+    const char* type = subs ? "sub" : "audio";
+    HMENU menu = CreatePopupMenu();
+    const UINT kOff = 1, kBase = 100;
+    bool anySelected = false;
+    int total = 0, shown = 0;
+    std::vector<int64_t> ids;
+    const Track* beyond = nullptr;
+    for (const Track& t : g_tracks) {
+        if (t.type != type) continue;
+        ++total;
+        if (t.selected) anySelected = true;
+        if (shown >= kMaxTrackMenu) {
+            if (t.selected) beyond = &t;  // keep the current track visible
+            continue;
+        }
+        AppendMenuW(menu, MF_STRING | (t.selected ? MF_CHECKED : 0), kBase + shown, TrackLabel(t).c_str());
+        ids.push_back(t.id);
+        ++shown;
+    }
+    if (subs) {
+        InsertMenuW(menu, 0, MF_BYPOSITION | MF_STRING | (!anySelected ? MF_CHECKED : 0), kOff, L"Off");
+        if (total) InsertMenuW(menu, 1, MF_BYPOSITION | MF_SEPARATOR, 0, nullptr);
+    }
+    if (!total)
+        AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, subs ? L"No subtitles" : L"No audio tracks");
+    if (total > shown) {
+        AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+        if (beyond) {
+            AppendMenuW(menu, MF_STRING | MF_CHECKED, kBase + ids.size(), TrackLabel(*beyond).c_str());
+            ids.push_back(beyond->id);
+        }
+        std::wstring more = L"... " + std::to_wstring(total - shown) + (subs ? L" more  ( j to cycle )" : L" more  ( # to cycle )");
+        AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, more.c_str());
+    }
+    RECT r;
+    GetWindowRect(button, &r);
+    // Open upwards: the button sits at the bottom of the window.
+    UINT cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_LEFTBUTTON | TPM_RIGHTBUTTON | TPM_LEFTALIGN | TPM_BOTTOMALIGN,
+                              r.left, r.top, 0, g_main, nullptr);
+    DestroyMenu(menu);
+    const char* prop = subs ? "sid" : "aid";
+    if (cmd == kOff) Cmd({"set", prop, "no"});
+    else if (cmd >= kBase && cmd < kBase + ids.size()) Cmd({"set", prop, std::to_string(ids[cmd - kBase])});
+    SetFocus(g_main);
+}
+
+// Subclass for the Subs / Audio buttons: click = cycle, hold = drop-down list.
+static const UINT_PTR kHoldTimer = 77;
+static const UINT kHoldMs = 400;
+static WNDPROC g_trackBtnOrigProc;
+static bool g_holdFired = false;
+
+static LRESULT CALLBACK TrackBtnProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
+    bool subs = GetDlgCtrlID(h) == IDC_BTN_SUB;
+    switch (msg) {
+    case WM_LBUTTONDOWN:
+    case WM_LBUTTONDBLCLK:
+        g_holdFired = false;
+        SetTimer(h, kHoldTimer, kHoldMs, nullptr);
+        break;
+    case WM_TIMER:
+        if (wp == kHoldTimer) {
+            KillTimer(h, kHoldTimer);
+            if (GetKeyState(VK_LBUTTON) < 0) {
+                g_holdFired = true;
+                // Release the button so it does not also fire a click.
+                SendMessageW(h, BM_SETSTATE, FALSE, 0);
+                ReleaseCapture();
+                ShowTrackMenu(h, subs);
+            }
+            return 0;
+        }
+        break;
+    case WM_LBUTTONUP:
+        KillTimer(h, kHoldTimer);
+        if (g_holdFired) { g_holdFired = false; return 0; }
+        break;
+    case WM_RBUTTONUP:
+        ShowTrackMenu(h, subs);
+        return 0;
+    }
+    return CallWindowProcW(g_trackBtnOrigProc, h, msg, wp, lp);
+}
+
 static void ShowPlayingStatus() {
     if (g_plIndex >= 0 && g_plIndex < (int)g_playlist.size()) {
         wchar_t b[64];
@@ -658,6 +808,7 @@ static bool InitMpv(std::string& err) {
     g_mpv.observe_property(g_mpvh, 0, "idle-active", MPV_FORMAT_FLAG);
     g_mpv.observe_property(g_mpvh, 0, "paused-for-cache", MPV_FORMAT_FLAG);
     g_mpv.observe_property(g_mpvh, 0, "cache-buffering-state", MPV_FORMAT_INT64);
+    g_mpv.observe_property(g_mpvh, 0, "track-list", MPV_FORMAT_NODE);
     g_mpv.set_wakeup_callback(g_mpvh, [](void*) { PostMessageW(g_main, WM_MPV_WAKEUP, 0, 0); }, nullptr);
     return true;
 }
@@ -703,6 +854,8 @@ static void HandleMpvEvents() {
             } else if (name == "cache-buffering-state") {
                 if (g_buffering && p->format == MPV_FORMAT_INT64)
                     SetStatus(L"Buffering... " + std::to_wstring(*(int64_t*)p->data) + L"%");
+            } else if (name == "track-list") {
+                ParseTrackList(p->format == MPV_FORMAT_NODE ? static_cast<mpv_node*>(p->data) : nullptr);
             } else if (name == "media-title") {
                 g_mediaTitle = p->format == MPV_FORMAT_STRING ? Utf8ToWide(*(char**)p->data) : L"";
                 InvalidateRect(g_video, nullptr, TRUE);
@@ -1630,8 +1783,8 @@ static void CreateControls() {
         {L"\u2212", L"Slower  ( [ )", true, 0},
         {L"1.00\u00D7", L"Playback speed - click to reset  ( Backspace )", false, 0},
         {L"+", L"Faster  ( ] )", true, 0},
-        {L"Subs", L"Cycle subtitles  ( j )", false, 0},
-        {L"Audio", L"Cycle audio track  ( # )", false, 0},
+        {L"Subs", L"Subtitles: click = next ( j ),  hold or right-click = choose from list", false, 0},
+        {L"Audio", L"Audio track: click = next ( # ),  hold or right-click = choose from list", false, 0},
         {L"Loop", L"Loop current file  ( L )", false, BS_AUTOCHECKBOX | BS_PUSHLIKE},
         {L"Fullscreen", L"Fullscreen  ( f, double click, Esc to leave )", false, 0},
         {L"\u2630", L"Show / hide the file browser", true, 0},
@@ -1646,6 +1799,8 @@ static void CreateControls() {
                                 CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, g_main, nullptr, g_inst, nullptr);
     SendMessageW(g_tooltip, TTM_SETMAXTIPWIDTH, 0, 400);
     for (int i = 0; i < IDC_BTN_LAST - IDC_BTN_FIRST; ++i) AddTip(g_btn[i], btns[i].tip);
+    g_trackBtnOrigProc = (WNDPROC)SetWindowLongPtrW(g_btn[IDC_BTN_SUB - IDC_BTN_FIRST], GWLP_WNDPROC, (LONG_PTR)TrackBtnProc);
+    SetWindowLongPtrW(g_btn[IDC_BTN_AUDIO - IDC_BTN_FIRST], GWLP_WNDPROC, (LONG_PTR)TrackBtnProc);
     AddTip(g_host, L"[user@]host, or a Host alias from %USERPROFILE%\\.ssh\\config");
     AddTip(g_port, L"SSH port (empty = 22 / from ssh config)");
     AddTip(g_pass, L"Optional. Leave empty to use keys / ssh-agent. Also used as key passphrase. Never saved.");
