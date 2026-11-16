@@ -50,7 +50,7 @@ host key is refused.
 | Loop | loop current file | `L` |
 | Fullscreen | toggle | `f`, double click, Esc leaves |
 | ☰ | show / hide the file browser | |
-| ⌂ (above the file list) | home folder: your Windows user folder; when connected to a Unix server (detected by `uname`), your home `~` there | |
+| ⌂ (above the file list) | home folder: your Windows user folder; on a server, `~` for Unix (detected by `uname`) or `%USERPROFILE%` for Windows | |
 | | mpv keyboard reference in your web browser | `F1` |
 
 - **Mouse wheel** over the video, seek bar or controls: up = forward 5 s, down = back 5 s
@@ -59,6 +59,11 @@ host key is refused.
   `%APPDATA%\mpv\mpv.conf` / `input.conf` are read.
 - **Volume is fixed at 100%** – the volume keys and wheel bindings are disabled and any change is
   reset. Use the Windows/system volume instead (keyboard volume keys still control Windows).
+
+**Windows servers:** the app runs a small `sh` script on the server, so a Windows server needs a
+POSIX shell for SSH sessions: Git for Windows (Git Bash), MSYS2 or Cygwin, set as the OpenSSH
+server's shell, or reachable as `sh` on its PATH. Servers whose SSH shell is only cmd or PowerShell are not
+supported. On such a Windows server, Home goes to your `%USERPROFILE%` there.
 
 ## Troubleshooting
 

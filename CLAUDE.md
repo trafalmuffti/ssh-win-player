@@ -24,8 +24,9 @@ Key design points:
   mpv: cache-pause-initial / cache-pause-wait=5 / demuxer-seekable-cache.
 - Subs / Audio buttons (TrackBtnProc): click cycles; hold 400 ms or right-click opens a popup of the
   first 20 tracks from the observed `track-list` (ShowTrackMenu); selecting sets sid / aid.
-- Home button (GoHome): local = %USERPROFILE%; remote = ~ if the server has uname (U command,
-  detected at connect, g_remoteIsUnix / g_remoteHome), else "/".
+- Home button (GoHome): local = %USERPROFILE%. Remote (DetectRemoteSystem at connect): uname
+  MINGW*/MSYS*/CYGWIN*/Windows_NT or no uname -> server %USERPROFILE% via `cygpath -u` (W command);
+  otherwise uname exists -> Unix -> ~ (P command); nothing found -> "/".
 - F1 opens https://mpv.io/manual/stable/#keyboard-control (app key path + forced mpv binding
   `F1 script-message swp-help`, so it also works when mpv's window has focus).
 - Volume is locked at 100% (bindings + property observer). Use the system volume.

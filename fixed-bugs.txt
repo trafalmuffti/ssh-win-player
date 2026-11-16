@@ -61,3 +61,12 @@ Fixed bugs
            or click selects (sets sid/aid). A selected track beyond the first 20 is still shown,
            ticked, below them; a "... N more" line says how many are hidden. Short click still
            cycles. '&' in titles is escaped so it is not eaten as a menu accelerator.
+
+2026-11-16  Home on a Windows server went to ~ instead of %USERPROFILE%
+  Symptom: connected to a Windows SSH server (Git Bash / MSYS2 / Cygwin shell), the Home button
+           opened the POSIX ~ (e.g. /home/<user> on Cygwin or MSYS2) instead of the Windows profile.
+  Cause:   these shells have uname, so the server was treated as Unix; uname -s output
+           (MINGW64_NT-..., MSYS_NT-..., CYGWIN_NT-..., Windows_NT) was not checked.
+  Fix:     new remote command W returns %USERPROFILE% converted with cygpath -u. At connect, if
+           uname reports a Windows POSIX layer (or there is no uname), Home goes there and the
+           status bar shows "(Windows)"; Unix servers still go to ~, otherwise "/".

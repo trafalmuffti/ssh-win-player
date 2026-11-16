@@ -52,6 +52,9 @@ public:
     bool home(std::string& path, std::string& err);
     // Runs `uname -s` if the server has uname (=> probably Unix).
     bool systemName(std::string& os, bool& hasUname, std::string& err);
+    // Windows servers (Git Bash / MSYS2 / Cygwin shells): %USERPROFILE% as a
+    // POSIX path via cygpath.  found = false when not available.
+    bool windowsProfile(std::string& path, bool& found, std::string& err);
     bool list(const std::string& path, std::string& realPath,
               std::vector<RemoteEntry>& out, std::string& err);
     bool size(const std::string& path, int64_t& sz, std::string& err);

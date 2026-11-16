@@ -79,8 +79,8 @@ static mpv_handle* g_mpvh = nullptr;
 static SshConn g_browseConn;  // directory listings (UI thread)
 static SshConn g_streamConn;  // file data (mpv threads)
 static bool g_connected = false;
-static bool g_remoteIsUnix = false;   // server has uname
-static std::string g_remoteHome;      // "~" of the remote user (Unix servers)
+static bool g_remoteIsWindows = false; // Windows server (uname MINGW/MSYS/CYGWIN, or %USERPROFILE%)
+static std::string g_remoteHome;        // Home target: ~ (Unix) or %USERPROFILE% (Windows)
 static std::wstring g_remoteOs;       // uname -s, e.g. "Linux"
 static const wchar_t* kHotkeyHelpUrl = L"https://mpv.io/manual/stable/#keyboard-control";
 static std::wstring g_connLabel;
@@ -1339,14 +1339,11 @@ static void Refresh() {
     else NavigateLocal(g_localPath, name);
 }
 
-// Home button: the Windows user folder locally; on a Unix server (uname
-// exists) the remote user's home (~).  Servers without uname go to "/".
+// Home button: the Windows user folder locally.  On a server: ~ for Unix
+// (uname exists), %USERPROFILE% for Windows (see DetectRemoteSystem), else "/".
 static void GoHome() {
     if (g_mode == Mode::Remote && g_connected) {
-        if (g_remoteIsUnix && !g_remoteHome.empty()) { NavigateRemote(g_remoteHome); return; }
-        std::string home, e;
-        if (g_remoteIsUnix && g_browseConn.home(home, e)) { g_remoteHome = home; NavigateRemote(home); return; }
-        NavigateRemote("/");
+        if (g_remoteHome.empty() || !NavigateRemote(g_remoteHome)) NavigateRemote("/");
         return;
     }
     wchar_t b[MAX_PATH];
@@ -1428,13 +1425,44 @@ static void Disconnect() {
     g_streamConn.disconnect();
     g_browseConn.disconnect();
     g_connected = false;
-    g_remoteIsUnix = false;
+    g_remoteIsWindows = false;
     g_remoteHome.clear();
     g_remoteOs.clear();
     SetWindowTextW(g_connectBtn, L"Connect");
     SetConnStatus();
     if (g_mode == Mode::Remote) NavigateLocal(g_localPath);
     else UpdatePathBox();
+}
+
+// Which kind of server is this, and where does Home go?
+//  - uname reports a Windows POSIX layer (Git Bash/MSYS2 "MINGW*"/"MSYS*",
+//    Cygwin "CYGWIN*", busybox-w32 "Windows_NT"), or there is no uname:
+//    try the server's %USERPROFILE% (converted with cygpath).
+//  - otherwise uname exists => Unix: Home = ~ (cd; pwd -P).
+//  - nothing found: "/".
+static bool IsWindowsUname(const std::string& os) {
+    for (const char* p : {"MINGW", "MSYS", "CYGWIN", "UWIN", "WINDOWS"})
+        if (_strnicmp(os.c_str(), p, strlen(p)) == 0) return true;
+    return false;
+}
+
+static void DetectRemoteSystem() {
+    std::string os, e, home;
+    bool hasUname = false, found = false;
+    g_browseConn.systemName(os, hasUname, e);
+    g_remoteIsWindows = false;
+    g_remoteHome.clear();
+    bool maybeWindows = !hasUname || IsWindowsUname(os);
+    if (maybeWindows && g_browseConn.windowsProfile(home, found, e) && found) {
+        g_remoteIsWindows = true;
+        g_remoteHome = home;
+    } else if (hasUname && g_browseConn.home(home, e)) {
+        g_remoteHome = home;
+    }
+    if (g_remoteIsWindows) g_remoteOs = L"Windows";
+    else g_remoteOs = Utf8ToWide(os);
+    AppLog("remote system: " + (hasUname ? (os.empty() ? std::string("?") : os) : std::string("no uname")) +
+           (g_remoteIsWindows ? " (Windows)" : "") + ", home: " + (g_remoteHome.empty() ? std::string("/") : g_remoteHome));
 }
 
 static void Connect() {
@@ -1470,18 +1498,7 @@ static void Connect() {
     }
     g_connected = true;
     g_connLabel = p.dest + (p.port.empty() ? L"" : (L":" + p.port));
-    // uname present => probably a Unix system: Home goes to the user's ~.
-    {
-        std::string os, e;
-        bool hasUname = false;
-        g_browseConn.systemName(os, hasUname, e);
-        g_remoteIsUnix = hasUname;
-        g_remoteOs = Utf8ToWide(os);
-        g_remoteHome.clear();
-        if (g_remoteIsUnix && !g_browseConn.home(g_remoteHome, e)) g_remoteHome.clear();
-        AppLog("remote system: " + (hasUname ? (os.empty() ? std::string("unix") : os) : std::string("no uname")) +
-               ", home: " + (g_remoteHome.empty() ? std::string("-") : g_remoteHome));
-    }
+    DetectRemoteSystem();
     SetWindowTextW(g_connectBtn, L"Disconnect");
     SetConnStatus();
     // Warm up the streaming connection in the background.
@@ -1851,7 +1868,7 @@ static void CreateControls() {
     AddTip(g_keyBrowse, L"Choose a private key file");
     AddTip(g_upBtn, L"Parent folder  ( Backspace )");
     AddTip(g_refreshBtn, L"Refresh");
-    AddTip(g_homeBtn, L"Home folder: your Windows user folder, or ~ on the server when connected");
+    AddTip(g_homeBtn, L"Home folder: your Windows user folder; on the server ~ (Unix) or %USERPROFILE% (Windows)");
     AddTip(g_localBtn, L"Switch between this PC and the remote server");
     AddTip(g_seek, L"Click or drag to seek; mouse wheel seeks \u00B15 s");
 
