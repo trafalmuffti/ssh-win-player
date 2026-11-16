@@ -61,19 +61,28 @@ static std::wstring QuoteArg(const std::wstring& a) {
 // The remote command loop.  POSIX sh, works with dash/bash/busybox/BSD sh.
 // Requests (one field per line):
 //   P                 -> OK \n <home dir>
-//   L \n path         -> OK \n <real path> \n names... \n //END//   | ERR
+//   L \n path         -> OK \n <real path> \n entries... \n //END//   | ERR
+//                        entry = <size>:<type>:<name>  (size -1 = unknown;
+//                        type d / directory / Directory = folder)
 //   S \n path         -> OK <size>                                  | ERR
 //   R \n off len \n p -> OK <n> \n <n raw bytes>                    | ERR
 // "//END//" can never be a file name because names cannot contain '/'.
 static const char* kRemoteScript =
     "sz(){ stat -c %s -- \"$1\" 2>/dev/null || stat -f %z -- \"$1\" 2>/dev/null || wc -c <\"$1\" 2>/dev/null; }\n"
     "LC_ALL=C; export LC_ALL\n"
+    "lsm(){ case $LM in\n"
+    "g) find -L . -mindepth 1 -maxdepth 1 -printf '%s:%y:%f\\n' </dev/null 2>/dev/null;;\n"
+    "s) stat -L -c '%s:%F:%n' -- * .[!.]* ..?* </dev/null 2>/dev/null;;\n"
+    "b) stat -L -f '%z:%HT:%N' -- * .[!.]* ..?* </dev/null 2>/dev/null;;\n"
+    "*) ls -1ApL </dev/null 2>/dev/null | while IFS= read -r n; do case \"$n\" in */) printf '%s:d:%s\\n' -1 \"${n%/}\";; *) printf '%s:f:%s\\n' -1 \"$n\";; esac; done;;\n"
+    "esac; }\n"
+    "LM=n; if [ \"$(find . -maxdepth 0 -printf x 2>/dev/null)\" = x ]; then LM=g; elif stat -L -c %s . >/dev/null 2>&1; then LM=s; elif stat -L -f %z . >/dev/null 2>&1; then LM=b; fi\n"
     "echo __SWP_READY__\n"
     "while IFS= read -r c; do\n"
     "case \"$c\" in\n"
     "P) cd 2>/dev/null; printf 'OK\\n%s\\n' \"$(pwd -P)\";;\n"
     "L) IFS= read -r p; if cd \"$p\" 2>/dev/null; then printf 'OK\\n%s\\n' \"$(pwd -P)\";"
-    " ls -1ApL </dev/null 2>/dev/null; echo '//END//'; else echo ERR; fi;;\n"
+    " lsm; echo '//END//'; else echo ERR; fi;;\n"
     "S) IFS= read -r p; s=''; [ -f \"$p\" ] && [ -r \"$p\" ] && s=$(sz \"$p\" </dev/null);"
     " if [ -n \"$s\" ]; then echo \"OK $((s+0))\"; else echo ERR; fi;;\n"
     "R) read -r o l; IFS= read -r p; s=''; [ -f \"$p\" ] && [ -r \"$p\" ] && s=$(sz \"$p\" </dev/null);"
@@ -370,6 +379,19 @@ bool SshConn::withRetry(F&& f, std::string& err) {
     return false;
 }
 
+// Parses "<size>:<type>:<name>" from the L command.
+static bool ParseEntry(const std::string& l, RemoteEntry& e) {
+    size_t a = l.find(':');
+    size_t b = a == std::string::npos ? a : l.find(':', a + 1);
+    if (b == std::string::npos || b + 1 >= l.size()) return false;
+    std::string size = l.substr(0, a), type = l.substr(a + 1, b - a - 1);
+    e.name = l.substr(b + 1);
+    if (e.name.size() > 2 && e.name.compare(0, 2, "./") == 0) e.name.erase(0, 2);
+    e.isDir = !type.empty() && (type[0] == 'd' || type[0] == 'D');
+    e.size = (!size.empty() && size[0] != '-') ? _strtoi64(size.c_str(), nullptr, 10) : -1;
+    return !e.name.empty();
+}
+
 static bool ValidPath(const std::string& p) { return p.find('\n') == std::string::npos && !p.empty(); }
 
 bool SshConn::home(std::string& path, std::string& err) {
@@ -397,8 +419,7 @@ bool SshConn::list(const std::string& path, std::string& realPath, std::vector<R
             if (l == "//END//") break;
             if (l.empty()) continue;
             RemoteEntry e;
-            if (l.back() == '/') { e.isDir = true; l.pop_back(); }
-            e.name = l;
+            if (!ParseEntry(l, e)) continue;
             if (e.name == "." || e.name == "..") continue;
             out.push_back(std::move(e));
         }

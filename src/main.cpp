@@ -250,7 +250,7 @@ static std::wstring FormatSize(int64_t sz) {
     int i = 0;
     while (v >= 1024 && i < 4) { v /= 1024; ++i; }
     if (i == 0) swprintf(b, 32, L"%lld B", (long long)sz);
-    else swprintf(b, 32, L"%.1f %s", v, u[i]);
+    else swprintf(b, 32, L"%.1f %ls", v, u[i]);
     return b;
 }
 
@@ -1068,6 +1068,7 @@ static bool NavigateRemote(const std::string& path, const std::wstring& selectNa
         e.raw = r.name;
         e.name = Utf8ToWide(r.name);
         e.isDir = r.isDir;
+        if (!r.isDir) e.size = r.size;
         g_entries.push_back(std::move(e));
     }
     SortEntries();

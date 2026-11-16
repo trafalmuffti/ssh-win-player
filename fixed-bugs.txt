@@ -33,3 +33,20 @@ Fixed bugs
            after a stall with 5 s buffered), demuxer-seekable-cache=yes (instant seeks back).
            Result in the same test: playback resumed 0.24 s after the seek, no stalls.
            Pipelining alone: 5.5 -> 11.5 MiB/s at 150 ms RTT.
+
+2026-11-16  Remote files showed no size in the file list
+  Symptom: the Size column was empty for every file on the SSH server (local files had sizes).
+  Cause:   the remote L (list) command only sent names (ls -1ApL), so the app never got sizes.
+  Fix:     L now returns "<size>:<type>:<name>" per entry from a single command per folder,
+           picking what the server has (detected once per connection): GNU find -printf,
+           else stat -c (GNU/busybox), else stat -f (BSD/macOS), else ls (no sizes, as before).
+           Parser splits on the first two ':' so names containing ':' still work.
+           Tested with GNU tools and busybox applets (names with spaces, ':', leading '-',
+           dotfiles, unicode, symlinked folder, empty folder).
+
+2026-11-16  File sizes showed a truncated unit ("115.2 M", "156.8 K")
+  Symptom: sizes of 1 KB and up lost the second letter of the unit (local and remote lists).
+  Cause:   swprintf(L"%.1f %s", ..., L"MB") - with this MinGW C runtime %s expects a narrow
+           string, so only the first wide character was printed. The 2026-11-15 entry
+           "Size column clipped values" misdiagnosed this as column width.
+  Fix:     use %ls (wide string) in FormatSize.

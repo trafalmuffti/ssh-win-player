@@ -26,6 +26,7 @@ struct SshParams {
 struct RemoteEntry {
     std::string name;  // UTF-8 (raw bytes from the server)
     bool isDir = false;
+    int64_t size = -1;  // bytes, -1 = unknown
 };
 
 class SshConn {
