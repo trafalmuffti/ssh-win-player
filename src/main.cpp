@@ -15,6 +15,10 @@
 #include <shlwapi.h>
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <set>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -321,42 +325,172 @@ static void SeekRel(double secs) {
 
 // ---------------------------------------------------------------------------
 // Remote stream callbacks for mpv ("sshwp://<percent encoded path>")
+//
+// Each open remote file gets a background prefetch thread and a block cache.
+// The thread keeps the data around the read position cached - 5 seconds
+// ahead and 5 seconds behind (estimated from file size / duration) - and
+// fetches it with pipelined requests, so a distant server is not limited to
+// one block per round trip.  mpv reads are served from the cache.
 // ---------------------------------------------------------------------------
+static const int64_t kPage = 256 * 1024;       // cache block (multiple of SshConn::kBlock)
+static const double kBufferSecs = 5.0;         // seconds to keep before and after the position
+static const int64_t kMinWindow = 2 * 1024 * 1024;
+static const int64_t kMaxWindow = 96 * 1024 * 1024;
+static std::atomic<double> g_streamDuration{0};  // duration of the playing file (for byte rate)
+
 struct RemoteStream {
     std::string path;
     int64_t size = 0;
-    int64_t pos = 0;
-    std::vector<char> buf;
-    int64_t bufOff = 0;
-    int64_t bufLen = 0;
-    int64_t chunk = 256 * 1024;
-    int64_t lastFetchEnd = -1;
+    int64_t pos = 0;      // mpv's position (only touched by mpv's thread)
+    std::mutex m;
+    std::condition_variable cv;
+    std::map<int64_t, std::vector<char>> pages;  // page index -> data
+    int64_t cachedBytes = 0;
+    std::set<int64_t> inflight;
+    int64_t readPos = 0;  // last position mpv read/seeked (shared with worker)
+    bool stop = false, failed = false;
+    double linkRate = 0;  // measured bytes/s
+    std::thread worker;
+    // stats for the log
+    int64_t fetched = 0;
+    int waits = 0;
+    double waitMs = 0;
 };
-static const int64_t kMinChunk = 256 * 1024;
-static const int64_t kMaxChunk = 2 * 1024 * 1024;
+
+static void RsWindows(const RemoteStream* rs, int64_t& ahead, int64_t& behind) {
+    double d = g_streamDuration.load();
+    double rate = d > 1.0 ? rs->size / d : 0.0;  // bytes per second of media
+    int64_t five = (int64_t)(rate * kBufferSecs);
+    ahead = std::max(kMinWindow, std::min(kMaxWindow, five));
+    behind = std::max(kMinWindow / 2, std::min(kMaxWindow, five));
+}
+
+// Next page to fetch (caller holds rs->m), or -1 when the window is complete.
+// Order: the page being read, a little ahead, the 5 s behind, then the rest
+// of the 5 s ahead.
+static int64_t RsNextWanted(RemoteStream* rs) {
+    if (rs->stop || rs->failed || rs->size <= 0) return -1;
+    int64_t last = (rs->size - 1) / kPage;
+    int64_t cur = std::min(rs->readPos, rs->size - 1) / kPage;
+    int64_t ahead, behind;
+    RsWindows(rs, ahead, behind);
+    int64_t aheadPages = (ahead + kPage - 1) / kPage;
+    int64_t behindPages = (behind + kPage - 1) / kPage;
+    auto want = [&](int64_t p) { return p >= 0 && p <= last && !rs->pages.count(p) && !rs->inflight.count(p); };
+    int64_t first = std::min<int64_t>(aheadPages, 4);
+    for (int64_t p = cur; p <= cur + first; ++p) if (want(p)) return p;
+    for (int64_t p = cur - 1; p >= cur - behindPages; --p) if (want(p)) return p;
+    for (int64_t p = cur + first + 1; p <= cur + aheadPages; ++p) if (want(p)) return p;
+    return -1;
+}
+
+// Drop the pages farthest from the read position when over budget.
+static void RsEvict(RemoteStream* rs) {
+    int64_t ahead, behind;
+    RsWindows(rs, ahead, behind);
+    int64_t cap = ahead + behind + 16 * 1024 * 1024;
+    int64_t cur = rs->readPos / kPage;
+    while (rs->cachedBytes > cap && rs->pages.size() > 1) {
+        auto lo = rs->pages.begin();
+        auto hi = std::prev(rs->pages.end());
+        auto victim = (cur - lo->first >= hi->first - cur) ? lo : hi;
+        if (victim->first == cur) break;
+        rs->cachedBytes -= (int64_t)victim->second.size();
+        rs->pages.erase(victim);
+    }
+}
+
+static void RsWorker(RemoteStream* rs) {
+    int failures = 0;
+    for (;;) {
+        int depth, perSession;
+        {
+            std::unique_lock<std::mutex> lk(rs->m);
+            rs->cv.wait(lk, [&] { return rs->stop || rs->failed || RsNextWanted(rs) >= 0; });
+            if (rs->stop || rs->failed) break;
+            // Keep about half a second of data in flight (8..32 blocks).
+            double target = std::max(2.0 * 1024 * 1024, std::min(8.0 * 1024 * 1024, rs->linkRate * 0.5));
+            depth = std::max(8, std::min(32, (int)(target / kPage)));
+            // Hand the connection back after ~1 s of transfer so subtitle
+            // streams / the next file can open without waiting long.
+            perSession = std::max(depth, std::min(64, (int)(rs->linkRate / kPage)));
+        }
+        auto tPrev = std::chrono::steady_clock::now();
+        bool firstAnswer = true;
+        int r = g_streamConn.readPipelined(
+            rs->path, kPage, depth, perSession,
+            [&]() -> int64_t {
+                std::lock_guard<std::mutex> lk(rs->m);
+                int64_t p = RsNextWanted(rs);
+                if (p < 0) return -1;
+                rs->inflight.insert(p);
+                return p * kPage;
+            },
+            [&](int64_t off, const char* data, int64_t n) {
+                auto now = std::chrono::steady_clock::now();
+                double dt = std::chrono::duration<double>(now - tPrev).count();
+                tPrev = now;
+                std::lock_guard<std::mutex> lk(rs->m);
+                int64_t p = off / kPage;
+                rs->inflight.erase(p);
+                if (n >= 0) {
+                    auto& page = rs->pages[p];
+                    rs->cachedBytes -= (int64_t)page.size();
+                    page.assign(data, data + n);
+                    rs->cachedBytes += n;
+                    rs->fetched += n;
+                    // Link speed from the gaps between answers of a full pipeline.
+                    if (!firstAnswer && dt > 0 && n == kPage) {
+                        double rate = n / dt;
+                        rs->linkRate = rs->linkRate > 0 ? rs->linkRate * 0.8 + rate * 0.2 : rate;
+                    }
+                    firstAnswer = false;
+                    RsEvict(rs);
+                }
+                rs->cv.notify_all();
+            });
+        {
+            std::lock_guard<std::mutex> lk(rs->m);
+            rs->inflight.clear();
+            if (r == 0 || (r < 0 && (++failures >= 3 || !g_streamConn.isEnabled()))) {
+                rs->failed = true;
+                rs->cv.notify_all();
+                AppLog("stream failed: " + rs->path);
+                break;
+            }
+            if (r > 0) failures = 0;
+        }
+        if (r < 0) Sleep(500);
+        else std::this_thread::yield();  // let other streams use the connection
+    }
+}
 
 static int64_t RsRead(void* cookie, char* out, uint64_t nbytes) {
     auto* rs = static_cast<RemoteStream*>(cookie);
     if (rs->pos >= rs->size) return 0;
-    if (!(rs->pos >= rs->bufOff && rs->pos < rs->bufOff + rs->bufLen)) {
-        int64_t off = rs->pos - (rs->pos % SshConn::kBlock);
-        if (off == rs->lastFetchEnd) rs->chunk = std::min(rs->chunk * 2, kMaxChunk);
-        else rs->chunk = kMinChunk;
-        if ((int64_t)rs->buf.size() < rs->chunk) rs->buf.resize(rs->chunk);
-        DWORD t0 = GetTickCount();
-        int64_t n = g_streamConn.read(rs->path, off, rs->chunk, rs->buf.data());
-        if (n < 0) return -1;
-        // Slow link: do not grow chunks further (keeps seeks responsive).
-        if (GetTickCount() - t0 > 1500) rs->chunk = std::max(kMinChunk, rs->chunk / 2);
-        rs->bufOff = off;
-        rs->bufLen = n;
-        rs->lastFetchEnd = off + n;
-        if (n == 0 || rs->pos >= off + n) return 0;
+    std::unique_lock<std::mutex> lk(rs->m);
+    if (rs->readPos != rs->pos) {
+        rs->readPos = rs->pos;
+        rs->cv.notify_all();
     }
-    int64_t avail = rs->bufOff + rs->bufLen - rs->pos;
+    int64_t p = rs->pos / kPage;
+    auto it = rs->pages.find(p);
+    if (it == rs->pages.end()) {
+        auto t0 = std::chrono::steady_clock::now();
+        rs->waits++;
+        rs->cv.wait(lk, [&] { return rs->stop || rs->failed || rs->pages.count(p); });
+        rs->waitMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        it = rs->pages.find(p);
+        if (it == rs->pages.end()) return -1;
+    }
+    int64_t inPage = rs->pos - p * kPage;
+    int64_t avail = (int64_t)it->second.size() - inPage;
+    if (avail <= 0) return 0;  // file shorter than expected
     int64_t k = std::min<int64_t>(avail, (int64_t)nbytes);
-    memcpy(out, rs->buf.data() + (rs->pos - rs->bufOff), (size_t)k);
+    memcpy(out, it->second.data() + inPage, (size_t)k);
     rs->pos += k;
+    rs->readPos = rs->pos;
+    if ((rs->pos / kPage) != p) rs->cv.notify_all();  // moved to a new page: prefetch further
     return k;
 }
 
@@ -364,12 +498,28 @@ static int64_t RsSeek(void* cookie, int64_t offset) {
     auto* rs = static_cast<RemoteStream*>(cookie);
     if (offset < 0 || offset > rs->size) return MPV_ERROR_GENERIC;
     rs->pos = offset;
+    std::lock_guard<std::mutex> lk(rs->m);
+    rs->readPos = offset;
+    rs->cv.notify_all();  // start fetching around the new position right away
     return offset;
 }
 
 static int64_t RsSize(void* cookie) { return static_cast<RemoteStream*>(cookie)->size; }
 
-static void RsClose(void* cookie) { delete static_cast<RemoteStream*>(cookie); }
+static void RsClose(void* cookie) {
+    auto* rs = static_cast<RemoteStream*>(cookie);
+    {
+        std::lock_guard<std::mutex> lk(rs->m);
+        rs->stop = true;
+        rs->cv.notify_all();
+    }
+    if (rs->worker.joinable()) rs->worker.join();
+    char b[256];
+    snprintf(b, sizeof(b), "stream closed: fetched %.1f MiB, link %.1f MiB/s, %d waits (%.0f ms) - ",
+             rs->fetched / 1048576.0, rs->linkRate / 1048576.0, rs->waits, rs->waitMs);
+    AppLog(b + rs->path);
+    delete rs;
+}
 
 static int RsOpen(void*, char* uri, mpv_stream_cb_info* info) {
     std::string u = uri;
@@ -385,6 +535,7 @@ static int RsOpen(void*, char* uri, mpv_stream_cb_info* info) {
     auto* rs = new RemoteStream;
     rs->path = path;
     rs->size = sz;
+    rs->worker = std::thread(RsWorker, rs);  // starts buffering immediately
     info->cookie = rs;
     info->read_fn = RsRead;
     info->seek_fn = RsSeek;
@@ -433,6 +584,15 @@ static const char* kBindings =
     "PREV script-message swp-prev\n";
 
 static void UpdateUiFromState();
+static bool g_buffering = false;
+
+static void ShowPlayingStatus() {
+    if (g_plIndex >= 0 && g_plIndex < (int)g_playlist.size()) {
+        wchar_t b[64];
+        swprintf(b, 64, L"  [%d/%d]", g_plIndex + 1, (int)g_playlist.size());
+        SetStatus(L"Playing: " + g_playlist[g_plIndex].name + b);
+    }
+}
 static void PlayIndex(int i);
 static void StopPlayback();
 static void ApplyFullscreen(bool fs);
@@ -457,6 +617,8 @@ static bool InitMpv(std::string& err) {
         {"demuxer-max-bytes", "256MiB"},
         {"demuxer-max-back-bytes", "64MiB"},
         {"demuxer-readahead-secs", "30"},
+        {"demuxer-seekable-cache", "yes"},  // seeking back within the buffer is instant
+        {"cache-pause-wait", "5"},          // after a stall, resume with 5 s buffered
         {"sub-auto", "fuzzy"},
         {"hr-seek", "yes"},              // precise seeks (wheel / arrows)
         {"hwdec", "auto-safe"},
@@ -494,6 +656,8 @@ static bool InitMpv(std::string& err) {
     g_mpv.observe_property(g_mpvh, 0, "loop-file", MPV_FORMAT_STRING);
     g_mpv.observe_property(g_mpvh, 0, "media-title", MPV_FORMAT_STRING);
     g_mpv.observe_property(g_mpvh, 0, "idle-active", MPV_FORMAT_FLAG);
+    g_mpv.observe_property(g_mpvh, 0, "paused-for-cache", MPV_FORMAT_FLAG);
+    g_mpv.observe_property(g_mpvh, 0, "cache-buffering-state", MPV_FORMAT_INT64);
     g_mpv.set_wakeup_callback(g_mpvh, [](void*) { PostMessageW(g_main, WM_MPV_WAKEUP, 0, 0); }, nullptr);
     return true;
 }
@@ -510,13 +674,14 @@ static void HandleMpvEvents() {
                 g_timePos = p->format == MPV_FORMAT_DOUBLE ? *(double*)p->data : 0;
             } else if (name == "duration") {
                 g_duration = p->format == MPV_FORMAT_DOUBLE ? *(double*)p->data : 0;
+                g_streamDuration = g_duration;  // lets the prefetcher size its 5 s windows
             } else if (name == "pause") {
                 g_paused = p->format == MPV_FORMAT_FLAG && *(int*)p->data;
             } else if (name == "speed") {
                 if (p->format == MPV_FORMAT_DOUBLE) g_speed = *(double*)p->data;
             } else if (name == "idle-active") {
                 g_idle = p->format == MPV_FORMAT_FLAG && *(int*)p->data;
-                if (g_idle) { g_timePos = 0; g_duration = 0; g_mediaTitle.clear(); }
+                if (g_idle) { g_timePos = 0; g_duration = 0; g_mediaTitle.clear(); g_streamDuration = 0; }
                 InvalidateRect(g_video, nullptr, TRUE);
             } else if (name == "fullscreen") {
                 if (p->format == MPV_FORMAT_FLAG) ApplyFullscreen(*(int*)p->data != 0);
@@ -530,6 +695,14 @@ static void HandleMpvEvents() {
             } else if (name == "loop-file") {
                 bool loop = p->format == MPV_FORMAT_STRING && strcmp(*(char**)p->data, "no") != 0;
                 SendMessageW(g_btn[IDC_BTN_LOOP - IDC_BTN_FIRST], BM_SETCHECK, loop ? BST_CHECKED : BST_UNCHECKED, 0);
+            } else if (name == "paused-for-cache") {
+                g_buffering = p->format == MPV_FORMAT_FLAG && *(int*)p->data;
+                AppLog(g_buffering ? "buffering started" : "buffering done");
+                if (g_buffering) SetStatus(L"Buffering...");
+                else if (!g_idle) ShowPlayingStatus();
+            } else if (name == "cache-buffering-state") {
+                if (g_buffering && p->format == MPV_FORMAT_INT64)
+                    SetStatus(L"Buffering... " + std::to_wstring(*(int64_t*)p->data) + L"%");
             } else if (name == "media-title") {
                 g_mediaTitle = p->format == MPV_FORMAT_STRING ? Utf8ToWide(*(char**)p->data) : L"";
                 InvalidateRect(g_video, nullptr, TRUE);
@@ -537,15 +710,12 @@ static void HandleMpvEvents() {
             break;
         }
         case MPV_EVENT_FILE_LOADED: {
+            AppLog("file loaded");
             // Select the first external subtitle; add the others as choices.
             for (size_t i = 0; i < g_pendingSubs.size(); ++i)
                 Cmd({"sub-add", g_pendingSubs[i], i == 0 ? "select" : "auto"});
             g_pendingSubs.clear();
-            if (g_plIndex >= 0 && g_plIndex < (int)g_playlist.size()) {
-                wchar_t b[64];
-                swprintf(b, 64, L"  [%d/%d]", g_plIndex + 1, (int)g_playlist.size());
-                SetStatus(L"Playing: " + g_playlist[g_plIndex].name + b);
-            }
+            ShowPlayingStatus();
             break;
         }
         case MPV_EVENT_END_FILE: {
@@ -569,6 +739,12 @@ static void HandleMpvEvents() {
             }
             break;
         }
+        case MPV_EVENT_SEEK:
+            AppLog("seek");
+            break;
+        case MPV_EVENT_PLAYBACK_RESTART:
+            AppLog("playback restart");
+            break;
         case MPV_EVENT_COMMAND_REPLY: {
             auto it = g_pendingCmds.find(ev->reply_userdata);
             if (it != g_pendingCmds.end()) {
@@ -616,9 +792,12 @@ static void PlayIndex(int i) {
     g_plIndex = i;
     const PlayItem& it = g_playlist[i];
     g_pendingSubs = it.subs;
+    g_streamDuration = 0;  // unknown until mpv reports the new file's duration
     if (it.remote) {
         std::string title = WideToUtf8(it.name);
-        Cmd({"loadfile", it.url, "replace", "-1", "force-media-title=" + MpvQuote(title)});
+        // Start playback only once 5 s are buffered (cache-pause-wait).
+        Cmd({"loadfile", it.url, "replace", "-1",
+             "force-media-title=" + MpvQuote(title) + ",cache-pause-initial=yes"});
     } else {
         Cmd({"loadfile", it.url, "replace"});
     }

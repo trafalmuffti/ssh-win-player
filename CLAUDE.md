@@ -19,6 +19,9 @@ Local files are supported too.
 Key design points:
 - Remote files are fed to mpv through a custom stream protocol `sshwp://<percent-encoded path>`
   (mpv_stream_cb_add_ro). Two ssh connections: one for browsing (UI thread), one for streaming.
+- Remote buffering: each RemoteStream has a prefetch thread + 256 KiB block cache keeping 5 s
+  before/after the read position, fetched with SshConn::readPipelined (many requests in flight).
+  mpv: cache-pause-initial / cache-pause-wait=5 / demuxer-seekable-cache.
 - Volume is locked at 100% (bindings + property observer). Use the system volume.
 - Mouse wheel seeks (±5 s, Shift ±30 s). mpv hotkeys are forwarded via the `keypress` command.
 - Password auth uses the exe itself as SSH_ASKPASS (env SSHWINPLAYER_ASKPASS=1).

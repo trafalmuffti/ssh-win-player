@@ -70,9 +70,16 @@ host key is refused.
 ## How it works
 
 One `ssh.exe` process per connection runs a tiny POSIX `sh` loop on the server. Directory
-listings use `ls`; file data is read in 64 KiB-aligned blocks with `dd`, so seeking costs one
-round trip. The data is handed to libmpv through a custom stream protocol (`sshwp://`), with a
-large demuxer cache for smooth playback. Browsing and streaming use separate connections.
+listings use `ls`; file data is read in 64 KiB-aligned blocks with `dd`. The data is handed to
+libmpv through a custom stream protocol (`sshwp://`). Browsing and streaming use separate
+connections.
+
+**Buffering for distant servers:** every remote file gets a background prefetcher that keeps
+**5 seconds before and 5 seconds after** the current position in memory (estimated from file
+size and duration). It fetches with many requests in flight at once (pipelining), so a server
+with high latency is not limited to one block per round trip. Playback starts once 5 s are
+buffered, resumes after a stall with 5 s buffered, and seeking back inside the buffer is instant.
+While buffering, the status bar shows `Buffering... NN%`.
 
 ## Build
 
