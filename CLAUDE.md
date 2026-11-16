@@ -22,6 +22,8 @@ Key design points:
 - Remote buffering: each RemoteStream has a prefetch thread + 256 KiB block cache keeping 5 s
   before/after the read position, fetched with SshConn::readPipelined (many requests in flight).
   mpv: cache-pause-initial / cache-pause-wait=5 / demuxer-seekable-cache.
+- Subs / Audio buttons (TrackBtnProc): click cycles; hold 400 ms or right-click opens a popup of the
+  first 20 tracks from the observed `track-list` (ShowTrackMenu); selecting sets sid / aid.
 - Volume is locked at 100% (bindings + property observer). Use the system volume.
 - Mouse wheel seeks (±5 s, Shift ±30 s). mpv hotkeys are forwarded via the `keypress` command.
 - Password auth uses the exe itself as SSH_ASKPASS (env SSHWINPLAYER_ASKPASS=1).

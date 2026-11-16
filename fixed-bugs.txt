@@ -33,3 +33,31 @@ Fixed bugs
            after a stall with 5 s buffered), demuxer-seekable-cache=yes (instant seeks back).
            Result in the same test: playback resumed 0.24 s after the seek, no stalls.
            Pipelining alone: 5.5 -> 11.5 MiB/s at 150 ms RTT.
+
+2026-11-16  Remote files showed no size in the file list
+  Symptom: the Size column was empty for every file on the SSH server (local files had sizes).
+  Cause:   the remote L (list) command only sent names (ls -1ApL), so the app never got sizes.
+  Fix:     L now returns "<size>:<type>:<name>" per entry from a single command per folder,
+           picking what the server has (detected once per connection): GNU find -printf,
+           else stat -c (GNU/busybox), else stat -f (BSD/macOS), else ls (no sizes, as before).
+           Parser splits on the first two ':' so names containing ':' still work.
+           Tested with GNU tools and busybox applets (names with spaces, ':', leading '-',
+           dotfiles, unicode, symlinked folder, empty folder).
+
+2026-11-16  File sizes showed a truncated unit ("115.2 M", "156.8 K")
+  Symptom: sizes of 1 KB and up lost the second letter of the unit (local and remote lists).
+  Cause:   swprintf(L"%.1f %s", ..., L"MB") - with this MinGW C runtime %s expects a narrow
+           string, so only the first wide character was printed. The 2026-11-15 entry
+           "Size column clipped values" misdiagnosed this as column width.
+  Fix:     use %ls (wide string) in FormatSize.
+
+2026-11-16  No way to pick a specific subtitle / audio track
+  Symptom: the Subs and Audio buttons could only cycle through tracks one by one, which is
+           slow on files with many tracks and gives no idea what each track is.
+  Cause:   missing feature (buttons were plain "cycle sub" / "cycle audio").
+  Fix:     holding the Subs or Audio button for 0.4 s (or right-clicking it) opens a drop-down
+           list of the first 20 tracks from mpv's track-list (id, title, language, codec,
+           external/default), the current one ticked; Subs also offers "Off". Hold-drag-release
+           or click selects (sets sid/aid). A selected track beyond the first 20 is still shown,
+           ticked, below them; a "... N more" line says how many are hidden. Short click still
+           cycles. '&' in titles is escaped so it is not eaten as a menu accelerator.

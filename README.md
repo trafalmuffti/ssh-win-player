@@ -46,7 +46,7 @@ host key is refused.
 | ▶ / ⏸ | play / pause | Space, `p`, right click |
 | ⏹ | stop | `q` |
 | − / 1.00× / + | slower / reset speed / faster | `[` / Backspace / `]` |
-| Subs / Audio | cycle subtitle / audio track | `j` / `#` |
+| Subs / Audio | click: next subtitle / audio track. **Hold** (or right-click): list of the first 20 tracks to choose from (Subs also has *Off*) | `j` / `#` |
 | Loop | loop current file | `L` |
 | Fullscreen | toggle | `f`, double click, Esc leaves |
 | ☰ | show / hide the file browser | |
