@@ -55,6 +55,8 @@ host key is refused.
 | ⌂ (above the file list) | home folder: your Windows user folder; on a server, `~` for Unix (detected by `uname`) or `%USERPROFILE%` for Windows | |
 | | mpv keyboard reference in your web browser | `F1` |
 
+- **Hover over the seek bar** to see the time under the cursor and how far that is from the
+  current position, e.g. `12:34  (+2:10)`.
 - **Mouse wheel** over the video, seek bar or controls: up = forward 5 s, down = back 5 s
   (hold **Shift** for 30 s).
 - All the usual **mpv hotkeys** work (they are forwarded to mpv), and your own
@@ -105,6 +107,13 @@ connections.
 size and duration). It fetches with many requests in flight at once (pipelining), so a server
 with high latency is not limited to one block per round trip. Playback starts once 5 s are
 buffered, resumes after a stall with 5 s buffered, and seeking back inside the buffer is instant.
+
+**Back buffer = keyframe interval:** an exact seek has to start decoding at the keyframe before
+the target, which can be several seconds earlier (often up to 10 s). So the player keeps
+**5 s + one keyframe interval** of already-played data in memory (at least 64 MiB). The
+interval is measured from the video's I-frames while playing; until a longer one is measured,
+10 s is assumed, so the buffer is big enough from the first second. Stepping back a few seconds
+then needs nothing from the server.
 While buffering, the status bar shows `Buffering... NN%`.
 
 ## Build

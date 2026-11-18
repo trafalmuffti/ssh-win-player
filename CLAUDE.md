@@ -31,6 +31,12 @@ Key design points:
 - Remote buffering: each RemoteStream has a prefetch thread + 256 KiB block cache keeping 5 s
   before/after the read position, fetched with SshConn::readPipelined (many requests in flight).
   mpv: cache-pause-initial / cache-pause-wait=5 / demuxer-seekable-cache.
+- Back buffer = 5 s + keyframe interval (ApplyBackBuffer -> demuxer-max-back-bytes at runtime, x1.5
+  for bitrate peaks, 64 MiB..1 GiB; prefetch "behind" window = max(5 s, interval)). Interval is
+  measured from video-frame-info/picture-type "I" gaps (gaps with dropped frames or a seek are
+  ignored) and assumed 10 s until a longer one is seen: data pruned before measuring is lost.
+- Seek bar hover tip (SeekProc / UpdateSeekTip): tracking tooltip with time under cursor and
+  offset from the current position, updated live.
 - Subs / Audio buttons (TrackBtnProc): click cycles; hold 400 ms or right-click opens a popup of the
   first 20 tracks from the observed `track-list` (ShowTrackMenu); selecting sets sid / aid.
 - Home button (GoHome): local = %USERPROFILE%. Remote (DetectRemoteSystem at connect): uname

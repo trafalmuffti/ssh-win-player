@@ -89,3 +89,19 @@ Fixed bugs
   Cause:   the R command always used dd.
   Fix:     if dd is missing, read with tail -c +OFFSET | head -c N (both in Coreutils for Windows);
            verified byte-for-byte against dd, including at end of file.
+
+2026-11-18  Seeking back stalled when the keyframe was outside the back buffer
+  Symptom: an exact seek back (e.g. -10 s) on high-bitrate video went back to the server and
+           paused ~3.5 s to rebuffer (100 Mbit/s file, keyframe every 8 s), although the target
+           had just been played.
+  Cause:   an exact seek decodes from the keyframe before the target (up to one keyframe
+           interval earlier). The back buffer was a fixed 64 MiB (~5 s at 12.5 MB/s) and the
+           prefetch "behind" window 5 s, both shorter than 5 s + keyframe interval.
+  Fix:     back buffer = 5 s + keyframe interval (demuxer-max-back-bytes set at runtime, min
+           64 MiB, x1.5 for bitrate peaks); prefetch behind window = max(5 s, interval). The
+           interval is measured from I-frame gaps (ignored when frames were dropped or after a
+           seek) and assumed 10 s until a longer one is seen, because a buffer enlarged only
+           after measuring has already lost the data (verified: runtime change works only if
+           early). Result: the same -10 s seek restarted in 0.44 s with no server access.
+  Note:    the 2026-11-15 buffering entry's "resumed 0.24 s after the seek" was measured with
+           the seek target already buffered; it did not cover this keyframe case.

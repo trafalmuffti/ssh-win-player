@@ -348,6 +348,15 @@ static const double kBufferSecs = 5.0;         // seconds to keep before and aft
 static const int64_t kMinWindow = 2 * 1024 * 1024;
 static const int64_t kMaxWindow = 96 * 1024 * 1024;
 static std::atomic<double> g_streamDuration{0};  // duration of the playing file (for byte rate)
+// Measured keyframe (I-frame) interval of the playing file in seconds, 0 = unknown.
+// The back buffers are sized from it so the keyframe needed for a precise seek
+// a few seconds back is still in memory.
+static std::atomic<double> g_keyframeInterval{0};
+// Assumed until a longer interval is measured (x264's default maximum is 250
+// frames = 10 s at 25 fps).  The buffers must be big enough from the start:
+// once data has been dropped from the back buffer it is gone.
+static const double kAssumedKeyframeInterval = 10.0;
+static double KeyframeIntervalForBuffers() { return std::max(kAssumedKeyframeInterval, g_keyframeInterval.load()); }
 
 struct RemoteStream {
     std::string path;
@@ -372,8 +381,10 @@ static void RsWindows(const RemoteStream* rs, int64_t& ahead, int64_t& behind) {
     double d = g_streamDuration.load();
     double rate = d > 1.0 ? rs->size / d : 0.0;  // bytes per second of media
     int64_t five = (int64_t)(rate * kBufferSecs);
+    // Behind: 5 s, or the keyframe interval when that is longer.
+    int64_t back = (int64_t)(rate * std::max(kBufferSecs, KeyframeIntervalForBuffers()));
     ahead = std::max(kMinWindow, std::min(kMaxWindow, five));
-    behind = std::max(kMinWindow / 2, std::min(kMaxWindow, five));
+    behind = std::max(kMinWindow / 2, std::min(kMaxWindow, back));
 }
 
 // Next page to fetch (caller holds rs->m), or -1 when the window is complete.
@@ -508,6 +519,7 @@ static int64_t RsRead(void* cookie, char* out, uint64_t nbytes) {
 static int64_t RsSeek(void* cookie, int64_t offset) {
     auto* rs = static_cast<RemoteStream*>(cookie);
     if (offset < 0 || offset > rs->size) return MPV_ERROR_GENERIC;
+    if (offset != rs->pos) AppLog("stream seek to byte " + std::to_string(offset));
     rs->pos = offset;
     std::lock_guard<std::mutex> lk(rs->m);
     rs->readPos = offset;
@@ -822,8 +834,67 @@ static bool InitMpv(std::string& err) {
     g_mpv.observe_property(g_mpvh, 0, "paused-for-cache", MPV_FORMAT_FLAG);
     g_mpv.observe_property(g_mpvh, 0, "cache-buffering-state", MPV_FORMAT_INT64);
     g_mpv.observe_property(g_mpvh, 0, "track-list", MPV_FORMAT_NODE);
+    g_mpv.observe_property(g_mpvh, 0, "file-size", MPV_FORMAT_INT64);
+    g_mpv.observe_property(g_mpvh, 0, "video-frame-info/picture-type", MPV_FORMAT_STRING);
+    g_mpv.observe_property(g_mpvh, 0, "frame-drop-count", MPV_FORMAT_INT64);
+    g_mpv.observe_property(g_mpvh, 0, "decoder-frame-drop-count", MPV_FORMAT_INT64);
     g_mpv.set_wakeup_callback(g_mpvh, [](void*) { PostMessageW(g_main, WM_MPV_WAKEUP, 0, 0); }, nullptr);
     return true;
+}
+
+// ---------------------------------------------------------------------------
+// Back buffer sized from the keyframe interval
+// ---------------------------------------------------------------------------
+static int64_t g_fileSize = 0;
+static double g_lastIFrameTime = -1;   // time-pos of the last I-frame seen (-1 after a seek)
+static int64_t g_backBytesSet = 0;
+static const int64_t kMinBackBytes = 64LL * 1024 * 1024;
+static const int64_t kMaxBackBytes = 1024LL * 1024 * 1024;
+
+// mpv's back buffer (demuxed data kept behind the playing position) holds
+// 5 s + one keyframe interval, so after stepping back 5 s the keyframe that a
+// precise seek decodes from is still in memory.  Never below 64 MiB.
+static void ApplyBackBuffer() {
+    double kfi = KeyframeIntervalForBuffers();
+    double rate = (g_fileSize > 0 && g_duration > 1.0) ? g_fileSize / g_duration : 0.0;
+    int64_t want = (int64_t)((kBufferSecs + kfi) * rate * 1.5);  // x1.5: bitrate peaks
+    want = std::max(kMinBackBytes, std::min(kMaxBackBytes, want));
+    if (std::llabs(want - g_backBytesSet) < 1024 * 1024) return;
+    g_backBytesSet = want;
+    Cmd({"set", "demuxer-max-back-bytes", std::to_string(want)});
+    char b[160];
+    snprintf(b, sizeof(b), "back buffer: %.0f MiB (keyframe interval used %.2f s, measured %.2f s, %.1f MiB/s)",
+             want / 1048576.0, kfi, g_keyframeInterval.load(), rate / 1048576.0);
+    AppLog(b);
+}
+
+static int64_t g_dropCount = 0, g_dropCountAtIFrame = 0;  // frames dropped (vo + decoder)
+
+static void ResetKeyframeInterval() {
+    g_keyframeInterval = 0;
+    g_lastIFrameTime = -1;
+    g_fileSize = 0;
+}
+
+// Called on every change of video-frame-info/picture-type: the time between
+// two I-frames (without a seek in between) is the keyframe interval.
+static void OnPictureType(const char* type) {
+    if (!type || strcmp(type, "I") != 0) return;
+    double t = g_timePos;
+    // A dropped frame may have been an I-frame: such a gap would be too long.
+    bool dropped = g_dropCount != g_dropCountAtIFrame;
+    if (g_lastIFrameTime >= 0 && !dropped) {
+        double gap = t - g_lastIFrameTime;
+        if (gap > 0.04 && gap <= 30.0 && gap > g_keyframeInterval.load() + 0.01) {
+            g_keyframeInterval = gap;
+            char b[96];
+            snprintf(b, sizeof(b), "keyframe interval measured: %.2f s", gap);
+            AppLog(b);
+            ApplyBackBuffer();
+        }
+    }
+    g_lastIFrameTime = t;
+    g_dropCountAtIFrame = g_dropCount;
 }
 
 static void HandleMpvEvents() {
@@ -839,6 +910,7 @@ static void HandleMpvEvents() {
             } else if (name == "duration") {
                 g_duration = p->format == MPV_FORMAT_DOUBLE ? *(double*)p->data : 0;
                 g_streamDuration = g_duration;  // lets the prefetcher size its 5 s windows
+                ApplyBackBuffer();
             } else if (name == "pause") {
                 g_paused = p->format == MPV_FORMAT_FLAG && *(int*)p->data;
             } else if (name == "speed") {
@@ -867,6 +939,16 @@ static void HandleMpvEvents() {
             } else if (name == "cache-buffering-state") {
                 if (g_buffering && p->format == MPV_FORMAT_INT64)
                     SetStatus(L"Buffering... " + std::to_wstring(*(int64_t*)p->data) + L"%");
+            } else if (name == "video-frame-info/picture-type") {
+                OnPictureType(p->format == MPV_FORMAT_STRING ? *(char**)p->data : nullptr);
+            } else if (name == "frame-drop-count" || name == "decoder-frame-drop-count") {
+                static int64_t vo = 0, dec = 0;
+                int64_t v = p->format == MPV_FORMAT_INT64 ? *(int64_t*)p->data : 0;
+                (name == "frame-drop-count" ? vo : dec) = v;
+                g_dropCount = vo + dec;
+            } else if (name == "file-size") {
+                g_fileSize = p->format == MPV_FORMAT_INT64 ? *(int64_t*)p->data : 0;
+                ApplyBackBuffer();
             } else if (name == "track-list") {
                 ParseTrackList(p->format == MPV_FORMAT_NODE ? static_cast<mpv_node*>(p->data) : nullptr);
             } else if (name == "media-title") {
@@ -908,6 +990,7 @@ static void HandleMpvEvents() {
         }
         case MPV_EVENT_SEEK:
             AppLog("seek");
+            g_lastIFrameTime = -1;  // do not measure a keyframe gap across a seek
             break;
         case MPV_EVENT_PLAYBACK_RESTART:
             AppLog("playback restart");
@@ -960,6 +1043,7 @@ static void PlayIndex(int i) {
     const PlayItem& it = g_playlist[i];
     g_pendingSubs = it.subs;
     g_streamDuration = 0;  // unknown until mpv reports the new file's duration
+    ResetKeyframeInterval();
     if (it.remote) {
         std::string title = WideToUtf8(it.name);
         // Start playback only once 5 s are buffered (cache-pause-wait).
@@ -1114,7 +1198,9 @@ static void ApplyFullscreen(bool fs) {
     }
 }
 
+static void UpdateSeekTip();
 static void UpdateUiFromState() {
+    UpdateSeekTip();  // hover tip shows the distance from the moving position
     static std::wstring lastTime, lastPlay, lastSpeed;
     std::wstring t = FormatTime(g_timePos) + L" / " + FormatTime(g_duration);
     if (g_idle) t = L"--:-- / --:--";
@@ -1705,18 +1791,94 @@ static bool PreTranslate(MSG& m) {
 // Window procedures
 // ---------------------------------------------------------------------------
 static WNDPROC g_seekOrigProc;
+
+// Position on the seek bar (0..1) for a client x coordinate.
+static double SeekFracFromX(HWND h, int x) {
+    RECT ch, th;
+    SendMessageW(h, TBM_GETCHANNELRECT, 0, (LPARAM)&ch);
+    SendMessageW(h, TBM_GETTHUMBRECT, 0, (LPARAM)&th);
+    int tw = (th.right - th.left) / 2;
+    int lo = ch.left + tw, hi = ch.right - tw;
+    double frac = hi > lo ? (double)(x - lo) / (hi - lo) : 0;
+    return std::max(0.0, std::min(1.0, frac));
+}
+
+// Hover tip on the seek bar: the time under the cursor and how far that is
+// from the current position, e.g. "12:34  (+2:10)".  Follows the cursor and
+// updates live while playing.
+static HWND g_seekTip;
+static bool g_seekTipActive = false;
+static int g_seekTipX = 0;
+static wchar_t g_seekTipText[96] = L"";
+
+static void UpdateSeekTip() {
+    if (!g_seekTipActive) return;
+    std::wstring text;
+    if (g_idle || g_duration <= 0) {
+        text = L"Click or drag to seek  \u2022  wheel \u00B15 s";
+    } else {
+        double t = SeekFracFromX(g_seek, g_seekTipX) * g_duration;
+        double d = t - g_timePos;
+        text = FormatTime(t) + L"  (" + (d < 0 ? L"\u2212" : L"+") + FormatTime(std::fabs(d)) + L")";
+    }
+    TOOLINFOW ti{};
+    ti.cbSize = sizeof(ti);
+    ti.hwnd = g_seek;
+    ti.uId = 1;
+    if (text != g_seekTipText) {
+        wcsncpy(g_seekTipText, text.c_str(), 95);
+        g_seekTipText[95] = 0;
+        ti.lpszText = g_seekTipText;
+        SendMessageW(g_seekTip, TTM_UPDATETIPTEXTW, 0, (LPARAM)&ti);
+    }
+    // Centre the tip above the cursor, just over the bar.
+    RECT br;
+    GetWindowRect(g_seek, &br);
+    POINT pt = {g_seekTipX, 0};
+    ClientToScreen(g_seek, &pt);
+    DWORD sz = (DWORD)SendMessageW(g_seekTip, TTM_GETBUBBLESIZE, 0, (LPARAM)&ti);
+    int w = LOWORD(sz), hgt = HIWORD(sz);
+    SendMessageW(g_seekTip, TTM_TRACKPOSITION, 0, MAKELPARAM(pt.x - w / 2, br.top - hgt - S(2)));
+}
+
+static void ShowSeekTip(bool on) {
+    if (on == g_seekTipActive) return;
+    g_seekTipActive = on;
+    TOOLINFOW ti{};
+    ti.cbSize = sizeof(ti);
+    ti.hwnd = g_seek;
+    ti.uId = 1;
+    if (on) UpdateSeekTip();
+    SendMessageW(g_seekTip, TTM_TRACKACTIVATE, on ? TRUE : FALSE, (LPARAM)&ti);
+    if (on) UpdateSeekTip();  // position again now that the size is known
+}
+
 static LRESULT CALLBACK SeekProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
+    if (msg == WM_MOUSEMOVE) {
+        g_seekTipX = GET_X_LPARAM(lp);
+        if (!g_seekTipActive) {
+            TRACKMOUSEEVENT tme = {sizeof(tme), TME_LEAVE, h, 0};
+            TrackMouseEvent(&tme);
+            ShowSeekTip(true);
+        } else {
+            UpdateSeekTip();
+        }
+    } else if (msg == WM_MOUSELEAVE) {
+        if (GetCapture() != h) ShowSeekTip(false);  // keep it while dragging the thumb
+    } else if (msg == WM_LBUTTONUP || msg == WM_CAPTURECHANGED) {
+        POINT pt;
+        GetCursorPos(&pt);
+        RECT r;
+        GetWindowRect(h, &r);
+        if (!PtInRect(&r, pt)) ShowSeekTip(false);
+    }
     if (msg == WM_LBUTTONDOWN) {
         // Jump directly to the clicked position (instead of paging).
-        RECT ch, th;
-        SendMessageW(h, TBM_GETCHANNELRECT, 0, (LPARAM)&ch);
+        RECT th;
         SendMessageW(h, TBM_GETTHUMBRECT, 0, (LPARAM)&th);
         int x = GET_X_LPARAM(lp);
         if (!(x >= th.left && x <= th.right)) {
-            int tw = (th.right - th.left) / 2;
-            int lo = ch.left + tw, hi = ch.right - tw;
-            double frac = hi > lo ? (double)(x - lo) / (hi - lo) : 0;
-            frac = std::max(0.0, std::min(1.0, frac));
+            double frac = SeekFracFromX(h, x);
             SendMessageW(h, TBM_SETPOS, TRUE, (LPARAM)(frac * 10000));
             if (!g_idle) {
                 char b[32];
@@ -1909,7 +2071,17 @@ static void CreateControls() {
     AddTip(g_refreshBtn, L"Refresh");
     AddTip(g_homeBtn, L"Home folder: your Windows user folder; on the server ~ (Unix) or %USERPROFILE% (Windows)");
     AddTip(g_localBtn, L"Switch between this PC and the remote server");
-    AddTip(g_seek, L"Click or drag to seek; mouse wheel seeks \u00B15 s");
+    g_seekTip = CreateWindowExW(WS_EX_TOPMOST, TOOLTIPS_CLASSW, nullptr, WS_POPUP | TTS_NOPREFIX | TTS_ALWAYSTIP,
+                                CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, g_main, nullptr, g_inst, nullptr);
+    {
+        TOOLINFOW ti{};
+        ti.cbSize = sizeof(ti);
+        ti.uFlags = TTF_TRACK | TTF_ABSOLUTE;
+        ti.hwnd = g_seek;
+        ti.uId = 1;
+        ti.lpszText = g_seekTipText;
+        SendMessageW(g_seekTip, TTM_ADDTOOLW, 0, (LPARAM)&ti);
+    }
 
     SetWindowTextW(g_host, IniGet(L"main", L"host").c_str());
     SetWindowTextW(g_port, IniGet(L"main", L"port").c_str());
