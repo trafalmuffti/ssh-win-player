@@ -70,3 +70,22 @@ Fixed bugs
   Fix:     new remote command W returns %USERPROFILE% converted with cygpath -u. At connect, if
            uname reports a Windows POSIX layer (or there is no uname), Home goes there and the
            status bar shows "(Windows)"; Unix servers still go to ~, otherwise "/".
+
+2026-11-18  Windows servers without a POSIX shell could not be used (incl. Coreutils-only servers)
+  Symptom: connecting to a stock Windows OpenSSH Server (cmd or PowerShell as SSH shell) failed;
+           installing Microsoft's Coreutils for Windows (Build 2026) on the server did not help.
+  Cause:   the server-side command loop was a POSIX sh script; Coreutils for Windows provides
+           ls/cat/tail/head/find/grep but no shell, no dd (and reportedly no uname).
+  Fix:     added a PowerShell 5.1 implementation of the same protocol, started with a short
+           -EncodedCommand bootstrap that reads the script from stdin (cmd.exe's 8191-char limit).
+           The client tries sh, then PowerShell (auth/host-key/network errors are not retried),
+           remembers the working shell per server, and shows Windows paths as C:\... .
+           NOT yet tested against a real Windows server (no Windows/PowerShell available in the
+           build environment); the sh -> PowerShell fallback and error reporting were tested.
+
+2026-11-18  File reads failed on servers without dd
+  Symptom: on a POSIX-shell server whose PATH lacks dd (e.g. Windows with Coreutils for Windows,
+           whose dd is "not yet implemented"), every read returned a short / broken response.
+  Cause:   the R command always used dd.
+  Fix:     if dd is missing, read with tail -c +OFFSET | head -c N (both in Coreutils for Windows);
+           verified byte-for-byte against dd, including at end of file.

@@ -80,6 +80,7 @@ static SshConn g_browseConn;  // directory listings (UI thread)
 static SshConn g_streamConn;  // file data (mpv threads)
 static bool g_connected = false;
 static bool g_remoteIsWindows = false; // Windows server (uname MINGW/MSYS/CYGWIN, or %USERPROFILE%)
+static bool g_remoteWinPaths = false;  // PowerShell server: paths are "/C:/dir" internally, shown as C:\dir
 static std::string g_remoteHome;        // Home target: ~ (Unix) or %USERPROFILE% (Windows)
 static std::wstring g_remoteOs;       // uname -s, e.g. "Linux"
 static const wchar_t* kHotkeyHelpUrl = L"https://mpv.io/manual/stable/#keyboard-control";
@@ -1146,9 +1147,37 @@ static int IconIndex(const std::wstring& name, bool dir) {
     return sfi.iIcon;
 }
 
+// PowerShell (Windows) servers use "/C:/Users/me" internally; show and accept
+// the familiar "C:\Users\me" (and "\\server\share") in the path box.
+static std::wstring RemotePathForDisplay(const std::string& posix) {
+    std::wstring w = Utf8ToWide(posix);
+    if (!g_remoteWinPaths || w == L"/") return w;
+    if (w.size() >= 2 && w[0] == L'/' && w[1] == L'/') {  // //server/share -> \\server\share
+        std::replace(w.begin(), w.end(), L'/', L'\\');
+        return w;
+    }
+    if (!w.empty() && w[0] == L'/') w.erase(0, 1);
+    std::replace(w.begin(), w.end(), L'/', L'\\');
+    if (w.size() == 2 && w[1] == L':') w += L'\\';  // "C:" -> "C:\"
+    return w;
+}
+
+static std::string RemotePathFromTyped(std::wstring t) {
+    if (g_remoteWinPaths) {
+        bool drive = t.size() >= 2 && iswalpha(t[0]) && t[1] == L':';
+        bool unc = t.size() >= 2 && t[0] == L'\\' && t[1] == L'\\';
+        if (drive || unc || t.find(L'\\') != std::wstring::npos) {
+            std::replace(t.begin(), t.end(), L'\\', L'/');
+            if (drive) t = L"/" + t;
+            while (t.size() > 1 && t.back() == L'/' && !(t.size() == 3 && t[2] == L':')) t.pop_back();
+        }
+    }
+    return WideToUtf8(t);
+}
+
 static void UpdatePathBox() {
     std::wstring p;
-    if (g_mode == Mode::Remote) p = Utf8ToWide(g_remotePath);
+    if (g_mode == Mode::Remote) p = RemotePathForDisplay(g_remotePath);
     else p = g_localPath.empty() ? L"This PC" : g_localPath;
     SetWindowTextW(g_path, p.c_str());
     SetWindowTextW(g_localBtn, (g_mode == Mode::Remote || !g_connected) ? L"Local files" : L"Remote files");
@@ -1409,7 +1438,7 @@ static void NavigateTyped() {
     std::wstring p = Trim(GetText(g_path));
     if (g_mode == Mode::Remote) {
         if (p.empty()) p = L"/";
-        NavigateRemote(WideToUtf8(p));
+        NavigateRemote(RemotePathFromTyped(p));
     } else {
         if (p == L"This PC") p.clear();
         NavigateLocal(p);
@@ -1426,6 +1455,7 @@ static void Disconnect() {
     g_browseConn.disconnect();
     g_connected = false;
     g_remoteIsWindows = false;
+    g_remoteWinPaths = false;
     g_remoteHome.clear();
     g_remoteOs.clear();
     SetWindowTextW(g_connectBtn, L"Connect");
@@ -1483,6 +1513,9 @@ static void Connect() {
     IniSet(L"main", L"port", p.port);
     IniSet(L"main", L"key", p.keyFile);
 
+    // Remote shell that worked last time for this server (sh or PowerShell).
+    std::wstring connKey = p.dest + (p.port.empty() ? L"" : (L":" + p.port));
+    if (IniGet(L"backend", connKey.c_str()) == L"powershell") p.backend = kBackendPowerShell;
     g_browseConn.setParams(p);
     g_streamConn.setParams(p);
     SetStatus(L"Connecting to " + p.dest + L"...");
@@ -1497,8 +1530,14 @@ static void Connect() {
         return;
     }
     g_connected = true;
-    g_connLabel = p.dest + (p.port.empty() ? L"" : (L":" + p.port));
+    g_connLabel = connKey;
+    // Let the streaming connection start with the shell that just worked.
+    p.backend = g_browseConn.activeBackend();
+    g_streamConn.setParams(p);
+    IniSet(L"backend", connKey.c_str(), p.backend == kBackendPowerShell ? L"powershell" : L"sh");
     DetectRemoteSystem();
+    g_remoteWinPaths = g_remoteIsWindows && p.backend == kBackendPowerShell;
+    AppLog(std::string("remote shell: ") + (p.backend == kBackendPowerShell ? "PowerShell" : "sh"));
     SetWindowTextW(g_connectBtn, L"Disconnect");
     SetConnStatus();
     // Warm up the streaming connection in the background.

@@ -17,7 +17,9 @@ its media files with **libmpv**, without copying the files first. It also plays 
 - The **OpenSSH Client** that comes with Windows (`C:\Windows\System32\OpenSSH\ssh.exe`).
   It is installed by default on current Windows; if not: *Settings → System → Optional features →
   Add a feature → OpenSSH Client*.
-- On the server: any normal Linux/BSD/macOS/NAS with `sh`, `ls`, `dd`, `stat` (nothing to install).
+- On the server, nothing to install:
+  - Linux / BSD / macOS / NAS: the usual `sh`, `ls`, `stat` (and `dd`, or `tail`/`head`).
+  - Windows with the built-in OpenSSH Server: PowerShell, which every Windows has.
 
 ## Use
 
@@ -60,24 +62,41 @@ host key is refused.
 - **Volume is fixed at 100%** – the volume keys and wheel bindings are disabled and any change is
   reset. Use the Windows/system volume instead (keyboard volume keys still control Windows).
 
-**Windows servers:** the app runs a small `sh` script on the server, so a Windows server needs a
-POSIX shell for SSH sessions: Git for Windows (Git Bash), MSYS2 or Cygwin, set as the OpenSSH
-server's shell, or reachable as `sh` on its PATH. Servers whose SSH shell is only cmd or PowerShell are not
-supported. On such a Windows server, Home goes to your `%USERPROFILE%` there.
+### Windows servers
+
+A stock Windows OpenSSH Server works: when the server has no POSIX `sh` (its SSH shell is cmd or
+PowerShell), the app automatically uses a PowerShell version of its server-side script. Paths are
+shown the Windows way (`C:\Users\me\Videos`; `/` lists the drives). You can type `C:\...` or
+`\\server\share\...` paths in the path box. Home goes to your `%USERPROFILE%` on the server.
+The PowerShell support is new and has not yet been tried against a real Windows server; please
+report problems (the log has the details).
+
+**Microsoft Coreutils for Windows** (`winget install Microsoft.Coreutils`, announced at Build
+2026) is *not* needed, and on its own it is not enough for the `sh` script either: it brings
+`ls`, `cat`, `tail`, `head`, `find`, `grep` and more, but no shell and (currently) no `dd`, and
+reportedly no `uname`. So on a server that only has Coreutils, the app uses the PowerShell script.
+If a Windows server *does* have a POSIX shell (Git Bash, MSYS2, Cygwin, busybox-w32), the `sh`
+script is used; if `dd` is missing there (e.g. when Coreutils' tools come first on the PATH), file
+data is read with `tail -c | head -c` instead.
 
 ## Troubleshooting
 
 - A log is written to `%APPDATA%\SshWinPlayer\log.txt` (ssh errors, mpv warnings).
 - Settings are in `%APPDATA%\SshWinPlayer\settings.ini`. To use a different ssh client, add
-  `sshExe=C:\path\to\ssh.exe` under `[main]`.
+  `sshExe=C:\path\to\ssh.exe` under `[main]`. The remote shell that worked for each server
+  (`sh` or `powershell`) is remembered under `[backend]`; delete the line to detect it again.
 - Password login relies on `SSH_ASKPASS`. If it fails with the old OpenSSH 8.1 shipped with some
   Windows 10 builds, use a key, or install a newer client from
   <https://github.com/PowerShell/Win32-OpenSSH/releases> and point `sshExe` at it.
 
 ## How it works
 
-One `ssh.exe` process per connection runs a tiny POSIX `sh` loop on the server. Directory
-listings use `ls`; file data is read in 64 KiB-aligned blocks with `dd`. The data is handed to
+One `ssh.exe` process per connection runs a tiny command loop on the server: a POSIX `sh`
+script, or on Windows servers without `sh` a PowerShell script (started with a short
+`-EncodedCommand` that reads the rest of the script from stdin). Both answer the same requests.
+Directory listings come with sizes from one command per folder (`find -printf`, `stat`, or
+.NET on Windows). File data is read in 64 KiB-aligned blocks with `dd` (or `tail | head`, or a
+.NET `FileStream` on Windows). The data is handed to
 libmpv through a custom stream protocol (`sshwp://`). Browsing and streaming use separate
 connections.
 

@@ -15,12 +15,16 @@
 #include <thread>
 #include <vector>
 
+// Remote command loop implementations.
+enum { kBackendSh = 1, kBackendPowerShell = 2 };
+
 struct SshParams {
     std::wstring sshExe;    // full path to ssh.exe
     std::wstring dest;      // [user@]host or ~/.ssh/config alias
     std::wstring port;      // optional
     std::wstring keyFile;   // optional identity file
     std::wstring password;  // optional (password or key passphrase)
+    int backend = 0;        // remote shell to try first (kBackendSh / kBackendPowerShell)
 };
 
 struct RemoteEntry {
@@ -72,11 +76,14 @@ public:
                       const std::function<int64_t()>& next,
                       const std::function<void(int64_t, const char*, int64_t)>& done);
     bool isEnabled() const { return enabled_; }
+    // Which remote shell the current connection uses (kBackendSh / kBackendPowerShell).
+    int activeBackend() { std::lock_guard<std::mutex> lk(mtx_); return activeBackend_; }
 
     std::string lastStderr();
 
 private:
     bool startLocked(std::string& err);
+    bool launchLocked(int backend, std::string& err);
     void stopLocked();
     bool aliveLocked();
     bool writeAll(const std::string& s);
@@ -88,6 +95,7 @@ private:
     SshParams params_;
     bool haveParams_ = false;
     std::atomic<bool> enabled_{false};
+    int activeBackend_ = 0;
     HANDLE proc_ = nullptr;
     std::atomic<HANDLE> procForKill_{nullptr};
     HANDLE inW_ = nullptr;   // our end of ssh stdin
