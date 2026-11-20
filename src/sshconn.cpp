@@ -61,15 +61,20 @@ static std::wstring QuoteArg(const std::wstring& a) {
 // The remote command loop.  POSIX sh, works with dash/bash/busybox/BSD sh.
 // Requests (one field per line):
 //   P                 -> OK \n <home dir>
+//   U                 -> OK <uname -s>  | ERR (no uname: probably not Unix)
+//   W                 -> OK \n <%USERPROFILE% as a POSIX path (cygpath)>  | ERR
 //   L \n path         -> OK \n <real path> \n entries... \n //END//   | ERR
 //                        entry = <size>:<type>:<name>  (size -1 = unknown;
 //                        type d / directory / Directory = folder)
 //   S \n path         -> OK <size>                                  | ERR
 //   R \n off len \n p -> OK <n> \n <n raw bytes>                    | ERR
+//   X \n path \n lines... \n //END//  -> OK | ERR   (write text file, atomic)
 // "//END//" can never be a file name because names cannot contain '/'.
 static const char* kRemoteScript =
     "sz(){ stat -c %s -- \"$1\" 2>/dev/null || stat -f %z -- \"$1\" 2>/dev/null || wc -c <\"$1\" 2>/dev/null; }\n"
     "LC_ALL=C; export LC_ALL\n"
+    // No dd (e.g. Microsoft's Coreutils for Windows): read with tail | head.
+    "if command -v dd >/dev/null 2>&1; then RD=dd; else RD=th; fi\n"
     "lsm(){ case $LM in\n"
     "g) find -L . -mindepth 1 -maxdepth 1 -printf '%s:%y:%f\\n' </dev/null 2>/dev/null;;\n"
     "s) stat -L -c '%s:%F:%n' -- * .[!.]* ..?* </dev/null 2>/dev/null;;\n"
@@ -81,18 +86,182 @@ static const char* kRemoteScript =
     "while IFS= read -r c; do\n"
     "case \"$c\" in\n"
     "P) cd 2>/dev/null; printf 'OK\\n%s\\n' \"$(pwd -P)\";;\n"
+    "W) p=''; if [ -n \"$USERPROFILE\" ]; then if command -v cygpath >/dev/null 2>&1;"
+    " then p=$(cygpath -u \"$USERPROFILE\" 2>/dev/null); else p=$USERPROFILE; fi; fi;"
+    " if [ -n \"$p\" ] && [ -d \"$p\" ]; then printf 'OK\\n%s\\n' \"$p\"; else echo ERR; fi;;\n"
+    "U) if command -v uname >/dev/null 2>&1; then printf 'OK %s\\n' \"$(uname -s 2>/dev/null)\"; else echo ERR; fi;;\n"
     "L) IFS= read -r p; if cd \"$p\" 2>/dev/null; then printf 'OK\\n%s\\n' \"$(pwd -P)\";"
     " lsm; echo '//END//'; else echo ERR; fi;;\n"
     "S) IFS= read -r p; s=''; [ -f \"$p\" ] && [ -r \"$p\" ] && s=$(sz \"$p\" </dev/null);"
     " if [ -n \"$s\" ]; then echo \"OK $((s+0))\"; else echo ERR; fi;;\n"
     "R) read -r o l; IFS= read -r p; s=''; [ -f \"$p\" ] && [ -r \"$p\" ] && s=$(sz \"$p\" </dev/null);"
     " if [ -n \"$s\" ]; then n=$((s-o)); [ $n -gt $l ] && n=$l; [ $n -lt 0 ] && n=0; echo \"OK $n\";"
-    " if [ $n -gt 0 ]; then dd if=\"$p\" bs=65536 skip=$((o/65536)) count=$(((n+65535)/65536)) 2>/dev/null </dev/null; fi;"
+    " if [ $n -gt 0 ]; then if [ \"$RD\" = dd ]; then dd if=\"$p\" bs=65536 skip=$((o/65536)) count=$(((n+65535)/65536)) 2>/dev/null </dev/null;"
+    " else tail -c +$((o+1)) \"$p\" 2>/dev/null </dev/null | head -c \"$n\"; fi; fi;"
     " else echo ERR; fi;;\n"
+    // X: write a small text file atomically (temp file + mv).  The content
+    // arrives as lines up to a "//END//" line, so no dd / byte counts needed.
+    "X) IFS= read -r p; t=\"$p.swp-tmp\"; if ( : > \"$t\" ) 2>/dev/null; then w=1; else w=0; t=/dev/null; fi;"
+    " while IFS= read -r l; do [ \"$l\" = '//END//' ] && break; printf '%s\\n' \"$l\"; done > \"$t\";"
+    " if [ $w = 1 ] && mv -f \"$t\" \"$p\" 2>/dev/null; then echo OK; else [ $w = 1 ] && rm -f \"$t\"; echo ERR; fi;;\n"
     "Q) exit 0;;\n"
     "*) echo ERR;;\n"
     "esac\n"
     "done\n";
+
+
+// PowerShell version of the same protocol, for Windows servers that have no
+// POSIX sh (Windows' OpenSSH server runs cmd or PowerShell; Microsoft's
+// Coreutils for Windows adds ls/cat/tail/... but no shell and no dd).
+// Written for Windows PowerShell 5.1 (always installed); also runs on pwsh.
+// Windows paths are exposed as POSIX-style paths so the client logic stays
+// the same:  "/" = list of drives,  "/C:/Users/me" = C:\Users\me,
+// "//server/share/x" = \\server\share\x.
+static const char* kPsScript = R"PS(
+$ErrorActionPreference = 'Stop'
+$in = $r
+$win = ($PSVersionTable.PSEdition -eq 'Desktop') -or $IsWindows
+$utf8 = New-Object System.Text.UTF8Encoding($false)
+$out = [Console]::OpenStandardOutput()
+$buf = New-Object byte[] 4194304
+function W1([string]$s) { $b = $utf8.GetBytes($s + "`n"); $out.Write($b, 0, $b.Length) }
+function ToNative([string]$p) {
+  if (-not $win) { return $p }
+  if ($p.StartsWith('//')) { return $p.Replace('/', '\') }
+  $s = $p.TrimStart('/')
+  if ($s -match '^[A-Za-z]:$') { $s = $s + '/' }
+  return $s.Replace('/', '\')
+}
+function ToPosix([string]$w) {
+  if (-not $win) { return $w }
+  if ($w.StartsWith('\\')) { return $w.Replace('\', '/').TrimEnd('/') }
+  return '/' + $w.Replace('\', '/').TrimEnd('/')
+}
+function HomeDir {
+  if ($win -and $env:USERPROFILE) { return (ToPosix $env:USERPROFILE) }
+  if ($HOME) { return (ToPosix $HOME) }
+  return '/'
+}
+$skip = 6   # FILE_ATTRIBUTE_HIDDEN (2) | FILE_ATTRIBUTE_SYSTEM (4); plain ints, not enum objects
+W1 '__SWP_READY__'
+$out.Flush()
+while ($true) {
+  $c = $in.ReadLine()
+  if ($c -eq $null) { break }
+  try {
+    if ($c -eq 'P') { W1 'OK'; W1 (HomeDir) }
+    elseif ($c -eq 'U') {
+      if ($win) { W1 'OK Windows_NT' } else { $u = ''; try { $u = [string](& uname -s) } catch { }; W1 ('OK ' + $u) }
+    }
+    elseif ($c -eq 'W') {
+      if ($env:USERPROFILE -and [IO.Directory]::Exists($env:USERPROFILE)) { W1 'OK'; W1 (ToPosix $env:USERPROFILE) } else { W1 'ERR' }
+    }
+    elseif ($c -eq 'L') {
+      $p = $in.ReadLine()
+      if ($win -and $p -eq '/') {
+        $lines = New-Object System.Collections.Generic.List[string]
+        foreach ($d in [IO.DriveInfo]::GetDrives()) { if ($d.IsReady) { $lines.Add('-1:d:' + $d.Name.TrimEnd('\')) } }
+        W1 'OK'; W1 '/'
+        foreach ($l in $lines) { W1 $l }
+        W1 '//END//'
+      } else {
+        $di = New-Object IO.DirectoryInfo((ToNative $p))
+        if (-not $di.Exists) { W1 'ERR' } else {
+          $lines = New-Object System.Collections.Generic.List[string]
+          try {
+            foreach ($e in $di.EnumerateFileSystemInfos()) {
+              $a = [int]$e.Attributes
+              if (-not ($win -and (($a -band $skip) -ne 0))) {
+                if (($a -band 16) -ne 0) { $lines.Add('-1:d:' + $e.Name) }
+                else { $lines.Add([string]$e.Length + ':f:' + $e.Name) }
+              }
+            }
+          } catch { }
+          W1 'OK'; W1 (ToPosix $di.FullName)
+          foreach ($l in $lines) { W1 $l }
+          W1 '//END//'
+        }
+      }
+    }
+    elseif ($c -eq 'S') {
+      $p = $in.ReadLine()
+      $fi = New-Object IO.FileInfo((ToNative $p))
+      if ($fi.Exists) { W1 ('OK ' + $fi.Length) } else { W1 'ERR' }
+    }
+    elseif ($c -eq 'R') {
+      $ol = $in.ReadLine().Split(' ')
+      $p = $in.ReadLine()
+      $o = [int64]$ol[0]; $l = [int64]$ol[1]
+      $fs = $null
+      try { $fs = New-Object IO.FileStream((ToNative $p), [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]'ReadWrite,Delete') } catch { }
+      if ($fs -eq $null) { W1 'ERR' } else {
+        $n = $fs.Length - $o
+        if ($n -gt $l) { $n = $l }
+        if ($n -lt 0) { $n = 0 }
+        if ($buf.Length -lt $n) { $buf = New-Object byte[] $n }
+        $got = 0
+        if ($n -gt 0) {
+          $fs.Position = $o
+          while ($got -lt $n) { $k = $fs.Read($buf, [int]$got, [int]($n - $got)); if ($k -le 0) { break }; $got += $k }
+        }
+        $fs.Close()
+        W1 ('OK ' + $got)
+        if ($got -gt 0) { $out.Write($buf, 0, [int]$got) }
+      }
+    }
+    elseif ($c -eq 'X') {
+      # Not used for Windows servers (no shared resume file there): consume the lines, refuse.
+      $p = $in.ReadLine()
+      while ($true) { $l = $in.ReadLine(); if ($l -eq $null -or $l -eq '//END//') { break } }
+      W1 'ERR'
+    }
+    elseif ($c -eq 'Q') { exit 0 }
+    else { W1 'ERR' }
+  } catch { W1 'ERR' }
+  $out.Flush()
+}
+exit 0
+)PS";
+
+// Small start-up command passed with -EncodedCommand: it reads the script
+// above from stdin (up to the #SWP-END# line) and runs it.  The script itself
+// is too long for cmd.exe's 8191 character command line.
+static const char* kPsBootstrap =
+    "$r=New-Object IO.StreamReader([Console]::OpenStandardInput(),(New-Object Text.UTF8Encoding($false)));"
+    "$b=New-Object Text.StringBuilder;"
+    "while($true){$l=$r.ReadLine();if($l -eq $null -or $l -eq '#SWP-END#'){break};[void]$b.AppendLine($l)};"
+    "Invoke-Expression $b.ToString()";
+
+// Base64 of UTF-16LE text, as PowerShell's -EncodedCommand expects.
+static std::wstring PsEncode(const char* script) {
+    std::string bytes;
+    for (const char* p = script; *p; ++p) { bytes += *p; bytes += '\0'; }  // ASCII -> UTF-16LE
+    static const char* tbl = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    std::wstring out;
+    size_t i = 0;
+    for (; i + 2 < bytes.size(); i += 3) {
+        unsigned v = ((unsigned char)bytes[i] << 16) | ((unsigned char)bytes[i + 1] << 8) | (unsigned char)bytes[i + 2];
+        out += tbl[v >> 18]; out += tbl[(v >> 12) & 63]; out += tbl[(v >> 6) & 63]; out += tbl[v & 63];
+    }
+    if (i + 1 == bytes.size()) {
+        unsigned v = (unsigned char)bytes[i] << 16;
+        out += tbl[v >> 18]; out += tbl[(v >> 12) & 63]; out += L"==";
+    } else if (i + 2 == bytes.size()) {
+        unsigned v = ((unsigned char)bytes[i] << 16) | ((unsigned char)bytes[i + 1] << 8);
+        out += tbl[v >> 18]; out += tbl[(v >> 12) & 63]; out += tbl[(v >> 6) & 63]; out += L'=';
+    }
+    return out;
+}
+
+// ssh errors where trying another remote shell cannot help.
+static bool IsFatalSshError(const std::string& e) {
+    for (const char* s : {"Permission denied", "Host key verification failed", "Could not resolve hostname",
+                          "Connection refused", "Connection timed out", "No route to host",
+                          "REMOTE HOST IDENTIFICATION HAS CHANGED", "Too many authentication failures",
+                          "Connection closed by"})
+        if (e.find(s) != std::string::npos) return true;
+    return false;
+}
 
 // ---------------------------------------------------------------------------
 // SshConn
@@ -186,6 +355,9 @@ static std::wstring BuildEnvBlock(const std::vector<std::wstring>& extra) {
     return block;
 }
 
+// Tries the remote shells in order: POSIX sh first, then PowerShell (Windows
+// servers).  params_.backend = kBackendPowerShell tries PowerShell first
+// (remembered per server by the UI).
 bool SshConn::startLocked(std::string& err) {
     if (!haveParams_) { err = "No connection parameters"; return false; }
     if (params_.sshExe.empty()) {
@@ -193,6 +365,25 @@ bool SshConn::startLocked(std::string& err) {
               "(Settings > System > Optional features).";
         return false;
     }
+    int order[2] = {kBackendSh, kBackendPowerShell};
+    if (params_.backend == kBackendPowerShell) std::swap(order[0], order[1]);
+    std::string errs[2];
+    for (int i = 0; i < 2; ++i) {
+        if (launchLocked(order[i], errs[i])) {
+            activeBackend_ = order[i];
+            return true;
+        }
+        if (IsFatalSshError(errs[i])) { err = errs[i]; return false; }
+        if (i == 0)
+            AppLog(std::string(order[i] == kBackendSh ? "sh" : "PowerShell") + " not usable on the server, trying " +
+                   (order[i] == kBackendSh ? "PowerShell" : "sh"));
+    }
+    err = "The server offers neither a POSIX shell (sh) nor PowerShell for this connection.\n\n"
+          "sh: " + errs[order[0] == kBackendSh ? 0 : 1] + "\n\nPowerShell: " + errs[order[0] == kBackendSh ? 1 : 0];
+    return false;
+}
+
+bool SshConn::launchLocked(int backend, std::string& err) {
     {
         std::lock_guard<std::mutex> lk(errMtx_);
         errText_.clear();
@@ -205,7 +396,15 @@ bool SshConn::startLocked(std::string& err) {
     if (params_.password.empty()) cmd += L" -o BatchMode=yes";
     if (!params_.port.empty()) cmd += L" -p " + QuoteArg(params_.port);
     if (!params_.keyFile.empty()) cmd += L" -i " + QuoteArg(params_.keyFile);
-    cmd += L" -- " + QuoteArg(params_.dest) + L" sh";
+    cmd += L" -- " + QuoteArg(params_.dest);
+    std::string initial;
+    if (backend == kBackendPowerShell) {
+        cmd += L" powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand " + PsEncode(kPsBootstrap);
+        initial = std::string(kPsScript) + "\n#SWP-END#\n";
+    } else {
+        cmd += L" sh";
+        initial = kRemoteScript;
+    }
 
     SECURITY_ATTRIBUTES sa{sizeof(sa), nullptr, TRUE};
     HANDLE inR = nullptr, inW = nullptr, outR = nullptr, outW = nullptr, errR = nullptr, errW = nullptr;
@@ -277,8 +476,10 @@ bool SshConn::startLocked(std::string& err) {
         }
     });
 
-    AppLog("starting: " + WideToUtf8(cmd));
-    if (!writeAll(kRemoteScript)) {
+    std::string logCmd = WideToUtf8(cmd);
+    if (logCmd.size() > 400) logCmd = logCmd.substr(0, 400) + "...";
+    AppLog("starting: " + logCmd);
+    if (!writeAll(initial)) {
         err = "Could not talk to ssh.exe";
     } else {
         // Skip anything a noisy shell rc file may print before our marker.
@@ -393,6 +594,86 @@ static bool ParseEntry(const std::string& l, RemoteEntry& e) {
 }
 
 static bool ValidPath(const std::string& p) { return p.find('\n') == std::string::npos && !p.empty(); }
+
+bool SshConn::readTextFile(const std::string& path, std::string& out, bool& exists, std::string& err) {
+    if (!ValidPath(path)) { err = "Invalid path"; return false; }
+    exists = false;
+    out.clear();
+    return withRetry([&]() -> int {
+        out.clear();
+        std::string l;
+        if (!writeAll("S\n" + path + "\n") || !readLine(l)) return -1;
+        if (l == "ERR") { exists = false; return 1; }  // no such file: not an error
+        if (l.compare(0, 3, "OK ") != 0) return -1;
+        int64_t size = _strtoi64(l.c_str() + 3, nullptr, 10);
+        if (size < 0 || size > 64 * 1024 * 1024) { err = "File too large"; return 0; }
+        const int64_t chunk = 1024 * 1024;
+        std::vector<char> buf((size_t)chunk);
+        for (int64_t off = 0; off < size; off += chunk) {
+            char req[64];
+            snprintf(req, sizeof(req), "R\n%lld %lld\n", (long long)off, (long long)chunk);
+            if (!writeAll(req + path + "\n") || !readLine(l)) return -1;
+            if (l == "ERR") { err = "Cannot read " + path; return 0; }
+            if (l.compare(0, 3, "OK ") != 0) return -1;
+            int64_t n = _strtoi64(l.c_str() + 3, nullptr, 10);
+            if (n < 0 || n > chunk) return -1;
+            if (n && !readExact(buf.data(), (size_t)n)) return -1;
+            out.append(buf.data(), (size_t)n);
+            if (n < chunk) break;
+        }
+        exists = true;
+        return 1;
+    }, err);
+}
+
+bool SshConn::writeTextFile(const std::string& path, const std::string& content, std::string& err) {
+    if (!ValidPath(path)) { err = "Invalid path"; return false; }
+    // Content travels as lines ending with a "//END//" line.
+    std::string body;
+    size_t start = 0;
+    while (start < content.size()) {
+        size_t nl = content.find('\n', start);
+        std::string line = content.substr(start, nl == std::string::npos ? std::string::npos : nl - start);
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        if (line == "//END//") { err = "Content contains the end marker"; return false; }
+        body += line + "\n";
+        if (nl == std::string::npos) break;
+        start = nl + 1;
+    }
+    return withRetry([&]() -> int {
+        std::string l;
+        if (!writeAll("X\n" + path + "\n" + body + "//END//\n") || !readLine(l)) return -1;
+        if (l == "OK") return 1;
+        if (l == "ERR") { err = "Cannot write " + path; return 0; }
+        return -1;
+    }, err);
+}
+
+bool SshConn::systemName(std::string& os, bool& hasUname, std::string& err) {
+    hasUname = false;
+    os.clear();
+    return withRetry([&]() -> int {
+        std::string l;
+        if (!writeAll("U\n") || !readLine(l)) return -1;
+        if (l == "ERR") return 1;
+        if (l.compare(0, 2, "OK") != 0) return -1;
+        hasUname = true;
+        os = l.size() > 3 ? l.substr(3) : "";
+        return 1;
+    }, err);
+}
+
+bool SshConn::windowsProfile(std::string& path, bool& found, std::string& err) {
+    found = false;
+    return withRetry([&]() -> int {
+        std::string l;
+        if (!writeAll("W\n") || !readLine(l)) return -1;
+        if (l == "ERR") return 1;
+        if (l != "OK" || !readLine(path)) return -1;
+        found = !path.empty();
+        return 1;
+    }, err);
+}
 
 bool SshConn::home(std::string& path, std::string& err) {
     return withRetry([&]() -> int {

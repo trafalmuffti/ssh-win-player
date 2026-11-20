@@ -61,3 +61,56 @@ Fixed bugs
            or click selects (sets sid/aid). A selected track beyond the first 20 is still shown,
            ticked, below them; a "... N more" line says how many are hidden. Short click still
            cycles. '&' in titles is escaped so it is not eaten as a menu accelerator.
+
+2026-11-16  Home on a Windows server went to ~ instead of %USERPROFILE%
+  Symptom: connected to a Windows SSH server (Git Bash / MSYS2 / Cygwin shell), the Home button
+           opened the POSIX ~ (e.g. /home/<user> on Cygwin or MSYS2) instead of the Windows profile.
+  Cause:   these shells have uname, so the server was treated as Unix; uname -s output
+           (MINGW64_NT-..., MSYS_NT-..., CYGWIN_NT-..., Windows_NT) was not checked.
+  Fix:     new remote command W returns %USERPROFILE% converted with cygpath -u. At connect, if
+           uname reports a Windows POSIX layer (or there is no uname), Home goes there and the
+           status bar shows "(Windows)"; Unix servers still go to ~, otherwise "/".
+
+2026-11-18  Windows servers without a POSIX shell could not be used (incl. Coreutils-only servers)
+  Symptom: connecting to a stock Windows OpenSSH Server (cmd or PowerShell as SSH shell) failed;
+           installing Microsoft's Coreutils for Windows (Build 2026) on the server did not help.
+  Cause:   the server-side command loop was a POSIX sh script; Coreutils for Windows provides
+           ls/cat/tail/head/find/grep but no shell, no dd (and reportedly no uname).
+  Fix:     added a PowerShell 5.1 implementation of the same protocol, started with a short
+           -EncodedCommand bootstrap that reads the script from stdin (cmd.exe's 8191-char limit).
+           The client tries sh, then PowerShell (auth/host-key/network errors are not retried),
+           remembers the working shell per server, and shows Windows paths as C:\... .
+           NOT yet tested against a real Windows server (no Windows/PowerShell available in the
+           build environment); the sh -> PowerShell fallback and error reporting were tested.
+
+2026-11-18  File reads failed on servers without dd
+  Symptom: on a POSIX-shell server whose PATH lacks dd (e.g. Windows with Coreutils for Windows,
+           whose dd is "not yet implemented"), every read returned a short / broken response.
+  Cause:   the R command always used dd.
+  Fix:     if dd is missing, read with tail -c +OFFSET | head -c N (both in Coreutils for Windows);
+           verified byte-for-byte against dd, including at end of file.
+
+2026-11-18  Seeking back stalled when the keyframe was outside the back buffer
+  Symptom: an exact seek back (e.g. -10 s) on high-bitrate video went back to the server and
+           paused ~3.5 s to rebuffer (100 Mbit/s file, keyframe every 8 s), although the target
+           had just been played.
+  Cause:   an exact seek decodes from the keyframe before the target (up to one keyframe
+           interval earlier). The back buffer was a fixed 64 MiB (~5 s at 12.5 MB/s) and the
+           prefetch "behind" window 5 s, both shorter than 5 s + keyframe interval.
+  Fix:     back buffer = 5 s + keyframe interval (demuxer-max-back-bytes set at runtime, min
+           64 MiB, x1.5 for bitrate peaks); prefetch behind window = max(5 s, interval). The
+           interval is measured from I-frame gaps (ignored when frames were dropped or after a
+           seek) and assumed 10 s until a longer one is seen, because a buffer enlarged only
+           after measuring has already lost the data (verified: runtime change works only if
+           early). Result: the same -10 s seek restarted in 0.44 s with no server access.
+  Note:    the 2026-11-15 buffering entry's "resumed 0.24 s after the seek" was measured with
+           the seek target already buffered; it did not cover this keyframe case.
+
+2026-11-20  Resume positions (new feature) - bugs found in review before release
+  1. Symptom: stopping a resumed video right after it opened would have deleted its saved
+     position. Cause: the tracked position started at 0 until mpv reported a time, and 0 counts as
+     "barely started" (forget). Fix: tracking starts at the resume position.
+  2. Symptom: "nearly finished" could go undetected. Cause: the duration was reset when the file
+     was loaded, after mpv might already have reported it. Fix: fall back to the current duration.
+  3. Symptom: mpv's own local "watch later" resume could override the shared server position.
+     Fix: remote files are loaded with resume-playback=no; the server position is passed as start=.

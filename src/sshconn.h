@@ -15,12 +15,16 @@
 #include <thread>
 #include <vector>
 
+// Remote command loop implementations.
+enum { kBackendSh = 1, kBackendPowerShell = 2 };
+
 struct SshParams {
     std::wstring sshExe;    // full path to ssh.exe
     std::wstring dest;      // [user@]host or ~/.ssh/config alias
     std::wstring port;      // optional
     std::wstring keyFile;   // optional identity file
     std::wstring password;  // optional (password or key passphrase)
+    int backend = 0;        // remote shell to try first (kBackendSh / kBackendPowerShell)
 };
 
 struct RemoteEntry {
@@ -50,6 +54,15 @@ public:
     // Requests.  Each one is atomic (internally locked) and transparently
     // reconnects once if the connection was lost.
     bool home(std::string& path, std::string& err);
+    // Runs `uname -s` if the server has uname (=> probably Unix).
+    bool systemName(std::string& os, bool& hasUname, std::string& err);
+    // Small text files (the shared resume-position file).  readTextFile sets
+    // exists = false (and returns true) when the file does not exist.
+    bool readTextFile(const std::string& path, std::string& out, bool& exists, std::string& err);
+    bool writeTextFile(const std::string& path, const std::string& content, std::string& err);
+    // Windows servers (Git Bash / MSYS2 / Cygwin shells): %USERPROFILE% as a
+    // POSIX path via cygpath.  found = false when not available.
+    bool windowsProfile(std::string& path, bool& found, std::string& err);
     bool list(const std::string& path, std::string& realPath,
               std::vector<RemoteEntry>& out, std::string& err);
     bool size(const std::string& path, int64_t& sz, std::string& err);
@@ -67,11 +80,14 @@ public:
                       const std::function<int64_t()>& next,
                       const std::function<void(int64_t, const char*, int64_t)>& done);
     bool isEnabled() const { return enabled_; }
+    // Which remote shell the current connection uses (kBackendSh / kBackendPowerShell).
+    int activeBackend() { std::lock_guard<std::mutex> lk(mtx_); return activeBackend_; }
 
     std::string lastStderr();
 
 private:
     bool startLocked(std::string& err);
+    bool launchLocked(int backend, std::string& err);
     void stopLocked();
     bool aliveLocked();
     bool writeAll(const std::string& s);
@@ -83,6 +99,7 @@ private:
     SshParams params_;
     bool haveParams_ = false;
     std::atomic<bool> enabled_{false};
+    int activeBackend_ = 0;
     HANDLE proc_ = nullptr;
     std::atomic<HANDLE> procForKill_{nullptr};
     HANDLE inW_ = nullptr;   // our end of ssh stdin
