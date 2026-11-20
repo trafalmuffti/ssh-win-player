@@ -7,9 +7,14 @@ its media files with **libmpv**, without copying the files first. It also plays 
 
 ## Download
 
-`release/SshWinPlayer-win64.zip` – unzip it anywhere and run `SshWinPlayer.exe`.
-(The zip has `SshWinPlayer.exe` and `libmpv-2.dll`, which must stay in the same folder.
-`release/SshWinPlayer.exe` is the program on its own, if you already have `libmpv-2.dll`.)
+Download the two files in `release/` and put them in the same folder:
+
+- `release/SshWinPlayer.exe` – the program
+- `release/libmpv-2.dll` – the player library (64-bit libmpv)
+
+Then run `SshWinPlayer.exe`. `libmpv-2.dll` is larger than GitHub's 100 MB file limit, so it is
+stored with Git LFS: on GitHub use the file's **Download** (raw) button; when cloning, have
+[Git LFS](https://git-lfs.com) installed (`git lfs install`, then clone as usual).
 
 ## Requirements
 
@@ -34,6 +39,20 @@ its media files with **libmpv**, without copying the files first. It also plays 
    use **Open...** (Ctrl+O), or pass files on the command line.
 
 Matching subtitles (`movie.srt` next to `movie.mkv`) are loaded automatically.
+
+### Resume on any device (Unix servers)
+
+On Linux / BSD / macOS / NAS servers, the playback position of every remote video is saved in
+one XML file in your home folder **on the server**: `~/.ssh-win-player-positions.xml`. Open the
+same video from any PC running SSH Win Player and it continues where you stopped. The position
+is saved when you stop, pause, switch files, disconnect or close the app, and every minute while
+playing. Videos played to the end (or stopped in the first 5 seconds) are removed from the list.
+Saves are merged with the file on the server, so several devices can be used at the same time.
+
+- **Shift**+double-click (or Shift+Enter) starts a video from the beginning instead.
+- Windows servers do not get this file (positions are not shared there).
+- To turn it off, add `resume=0` under `[main]` in `settings.ini`.
+- The status bar shows `• resume synced` when it is active for the connected server.
 New host keys are accepted on first connect (`StrictHostKeyChecking=accept-new`); a *changed*
 host key is refused.
 

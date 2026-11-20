@@ -37,6 +37,12 @@ Key design points:
   ignored) and assumed 10 s until a longer one is seen: data pruned before measuring is lost.
 - Seek bar hover tip (SeekProc / UpdateSeekTip): tracking tooltip with time under cursor and
   offset from the current position, updated live.
+- Shared resume (Unix servers only, g_resumeEnabled): ~/.ssh-win-player-positions.xml on the server.
+  Format + merge rules in src/resume_xml.h (no Windows headers; unit test: `g++ -std=c++17 -I src
+  tests/resume_test.cpp -o /tmp/rt && /tmp/rt`). Saves go through a worker thread (QueueResume ->
+  ProcessResumeJob: read file, merge newest-wins, write via the X command = temp file + mv);
+  PlayIndex re-reads the file and passes start=<pos> (Shift = from the beginning). Saved on
+  END_FILE / pause / 60 s timer / Disconnect / WM_CLOSE (WaitResumeIdle before closing the conns).
 - Subs / Audio buttons (TrackBtnProc): click cycles; hold 400 ms or right-click opens a popup of the
   first 20 tracks from the observed `track-list` (ShowTrackMenu); selecting sets sid / aid.
 - Home button (GoHome): local = %USERPROFILE%. Remote (DetectRemoteSystem at connect): uname

@@ -56,6 +56,10 @@ public:
     bool home(std::string& path, std::string& err);
     // Runs `uname -s` if the server has uname (=> probably Unix).
     bool systemName(std::string& os, bool& hasUname, std::string& err);
+    // Small text files (the shared resume-position file).  readTextFile sets
+    // exists = false (and returns true) when the file does not exist.
+    bool readTextFile(const std::string& path, std::string& out, bool& exists, std::string& err);
+    bool writeTextFile(const std::string& path, const std::string& content, std::string& err);
     // Windows servers (Git Bash / MSYS2 / Cygwin shells): %USERPROFILE% as a
     // POSIX path via cygpath.  found = false when not available.
     bool windowsProfile(std::string& path, bool& found, std::string& err);

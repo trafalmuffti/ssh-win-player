@@ -68,6 +68,7 @@ static std::wstring QuoteArg(const std::wstring& a) {
 //                        type d / directory / Directory = folder)
 //   S \n path         -> OK <size>                                  | ERR
 //   R \n off len \n p -> OK <n> \n <n raw bytes>                    | ERR
+//   X \n path \n lines... \n //END//  -> OK | ERR   (write text file, atomic)
 // "//END//" can never be a file name because names cannot contain '/'.
 static const char* kRemoteScript =
     "sz(){ stat -c %s -- \"$1\" 2>/dev/null || stat -f %z -- \"$1\" 2>/dev/null || wc -c <\"$1\" 2>/dev/null; }\n"
@@ -98,6 +99,11 @@ static const char* kRemoteScript =
     " if [ $n -gt 0 ]; then if [ \"$RD\" = dd ]; then dd if=\"$p\" bs=65536 skip=$((o/65536)) count=$(((n+65535)/65536)) 2>/dev/null </dev/null;"
     " else tail -c +$((o+1)) \"$p\" 2>/dev/null </dev/null | head -c \"$n\"; fi; fi;"
     " else echo ERR; fi;;\n"
+    // X: write a small text file atomically (temp file + mv).  The content
+    // arrives as lines up to a "//END//" line, so no dd / byte counts needed.
+    "X) IFS= read -r p; t=\"$p.swp-tmp\"; if ( : > \"$t\" ) 2>/dev/null; then w=1; else w=0; t=/dev/null; fi;"
+    " while IFS= read -r l; do [ \"$l\" = '//END//' ] && break; printf '%s\\n' \"$l\"; done > \"$t\";"
+    " if [ $w = 1 ] && mv -f \"$t\" \"$p\" 2>/dev/null; then echo OK; else [ $w = 1 ] && rm -f \"$t\"; echo ERR; fi;;\n"
     "Q) exit 0;;\n"
     "*) echo ERR;;\n"
     "esac\n"
@@ -202,6 +208,12 @@ while ($true) {
         W1 ('OK ' + $got)
         if ($got -gt 0) { $out.Write($buf, 0, [int]$got) }
       }
+    }
+    elseif ($c -eq 'X') {
+      # Not used for Windows servers (no shared resume file there): consume the lines, refuse.
+      $p = $in.ReadLine()
+      while ($true) { $l = $in.ReadLine(); if ($l -eq $null -or $l -eq '//END//') { break } }
+      W1 'ERR'
     }
     elseif ($c -eq 'Q') { exit 0 }
     else { W1 'ERR' }
@@ -582,6 +594,60 @@ static bool ParseEntry(const std::string& l, RemoteEntry& e) {
 }
 
 static bool ValidPath(const std::string& p) { return p.find('\n') == std::string::npos && !p.empty(); }
+
+bool SshConn::readTextFile(const std::string& path, std::string& out, bool& exists, std::string& err) {
+    if (!ValidPath(path)) { err = "Invalid path"; return false; }
+    exists = false;
+    out.clear();
+    return withRetry([&]() -> int {
+        out.clear();
+        std::string l;
+        if (!writeAll("S\n" + path + "\n") || !readLine(l)) return -1;
+        if (l == "ERR") { exists = false; return 1; }  // no such file: not an error
+        if (l.compare(0, 3, "OK ") != 0) return -1;
+        int64_t size = _strtoi64(l.c_str() + 3, nullptr, 10);
+        if (size < 0 || size > 64 * 1024 * 1024) { err = "File too large"; return 0; }
+        const int64_t chunk = 1024 * 1024;
+        std::vector<char> buf((size_t)chunk);
+        for (int64_t off = 0; off < size; off += chunk) {
+            char req[64];
+            snprintf(req, sizeof(req), "R\n%lld %lld\n", (long long)off, (long long)chunk);
+            if (!writeAll(req + path + "\n") || !readLine(l)) return -1;
+            if (l == "ERR") { err = "Cannot read " + path; return 0; }
+            if (l.compare(0, 3, "OK ") != 0) return -1;
+            int64_t n = _strtoi64(l.c_str() + 3, nullptr, 10);
+            if (n < 0 || n > chunk) return -1;
+            if (n && !readExact(buf.data(), (size_t)n)) return -1;
+            out.append(buf.data(), (size_t)n);
+            if (n < chunk) break;
+        }
+        exists = true;
+        return 1;
+    }, err);
+}
+
+bool SshConn::writeTextFile(const std::string& path, const std::string& content, std::string& err) {
+    if (!ValidPath(path)) { err = "Invalid path"; return false; }
+    // Content travels as lines ending with a "//END//" line.
+    std::string body;
+    size_t start = 0;
+    while (start < content.size()) {
+        size_t nl = content.find('\n', start);
+        std::string line = content.substr(start, nl == std::string::npos ? std::string::npos : nl - start);
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        if (line == "//END//") { err = "Content contains the end marker"; return false; }
+        body += line + "\n";
+        if (nl == std::string::npos) break;
+        start = nl + 1;
+    }
+    return withRetry([&]() -> int {
+        std::string l;
+        if (!writeAll("X\n" + path + "\n" + body + "//END//\n") || !readLine(l)) return -1;
+        if (l == "OK") return 1;
+        if (l == "ERR") { err = "Cannot write " + path; return 0; }
+        return -1;
+    }, err);
+}
 
 bool SshConn::systemName(std::string& os, bool& hasUname, std::string& err) {
     hasUname = false;

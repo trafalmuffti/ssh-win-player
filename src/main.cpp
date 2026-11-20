@@ -15,6 +15,9 @@
 #include <shlwapi.h>
 
 #include <algorithm>
+#include <ctime>
+#include <deque>
+#include <thread>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -29,6 +32,7 @@
 
 #include "mpv_dyn.h"
 #include "sshconn.h"
+#include "resume_xml.h"
 
 MpvApi g_mpv;
 
@@ -83,6 +87,8 @@ static bool g_remoteIsWindows = false; // Windows server (uname MINGW/MSYS/CYGWI
 static bool g_remoteWinPaths = false;  // PowerShell server: paths are "/C:/dir" internally, shown as C:\dir
 static std::string g_remoteHome;        // Home target: ~ (Unix) or %USERPROFILE% (Windows)
 static std::wstring g_remoteOs;       // uname -s, e.g. "Linux"
+static bool g_remoteIsUnix = false;    // uname exists and is not a Windows POSIX layer
+static bool g_resumeEnabled = false;   // shared resume positions in ~ on the server (Unix only)
 static const wchar_t* kHotkeyHelpUrl = L"https://mpv.io/manual/stable/#keyboard-control";
 static std::wstring g_connLabel;
 
@@ -116,6 +122,7 @@ struct PlayItem {
     std::wstring name;
     std::wstring dir;  // folder it came from (for highlighting)
     bool remote = false;
+    std::string remotePath;  // server path (remote items), key for resume positions
     std::vector<std::string> subs;
 };
 static std::vector<PlayItem> g_playlist;
@@ -261,7 +268,8 @@ static std::wstring FormatSize(int64_t sz) {
 
 static void SetStatus(const std::wstring& s) { SendMessageW(g_status, SB_SETTEXTW, 0, (LPARAM)s.c_str()); }
 static void SetConnStatus() {
-    std::wstring s = g_connected ? (L"Connected: " + g_connLabel + (g_remoteOs.empty() ? L"" : L"  (" + g_remoteOs + L")"))
+    std::wstring s = g_connected ? (L"Connected: " + g_connLabel + (g_remoteOs.empty() ? L"" : L"  (" + g_remoteOs + L")") +
+                                    (g_resumeEnabled ? L"  \u2022 resume synced" : L""))
                                  : L"Not connected";
     SendMessageW(g_status, SB_SETTEXTW, 1, (LPARAM)s.c_str());
 }
@@ -897,6 +905,150 @@ static void OnPictureType(const char* type) {
     g_dropCountAtIFrame = g_dropCount;
 }
 
+// ---------------------------------------------------------------------------
+// Shared resume positions (Unix servers only)
+//
+// Playback positions of remote videos are kept in one XML file in the user's
+// home folder on the server, so any device connecting to that server resumes
+// where the last one stopped.  Every save re-reads the server file and merges
+// (newest "updated" wins per file), so devices do not overwrite each other.
+// Windows servers are left alone.
+// ---------------------------------------------------------------------------
+static const char* kResumeFileName = ".ssh-win-player-positions.xml";
+static const UINT_PTR kResumeTimer = 78;
+static const UINT kResumeTimerMs = 60000;       // periodic save while playing
+
+static std::mutex g_resumeMtx;
+static std::map<std::string, ResumeEntry> g_resumeCache;
+static std::string g_resumeFile;
+static std::string g_resumeLoadingPath, g_resumeCurPath;  // file being opened / playing
+static double g_resumeCurPos = 0, g_resumeCurDur = 0, g_resumeLastSaved = -1;
+static double g_resumeLoadingStart = 0;  // position the file being opened starts at
+
+struct ResumeJob {
+    std::string file, path;
+    double pos = 0, duration = 0;
+    bool remove = false;
+    int64_t updated = 0;
+};
+static std::mutex g_resumeQMtx;
+static std::condition_variable g_resumeQCv;
+static std::deque<ResumeJob> g_resumeQueue;
+static bool g_resumeBusy = false, g_resumeStop = false;
+static std::thread g_resumeThread;
+
+
+
+static void ProcessResumeJob(const ResumeJob& j) {
+    std::string text, err;
+    bool exists = false;
+    if (!g_browseConn.readTextFile(j.file, text, exists, err)) {
+        AppLog("resume: cannot read " + j.file + ": " + err);
+        return;
+    }
+    std::map<std::string, ResumeEntry> m;
+    if (exists) ParseResumeXml(text, m);
+    ApplyResumeChange(m, j.path, j.pos, j.duration, j.remove, j.updated);
+    if (!g_browseConn.writeTextFile(j.file, BuildResumeXml(m), err)) {
+        AppLog("resume: cannot write " + j.file + ": " + err);
+        return;
+    }
+    char b[64];
+    snprintf(b, sizeof(b), j.remove ? "resume: cleared " : "resume: saved %.1f s ", j.pos);
+    AppLog(b + j.path);
+    std::lock_guard<std::mutex> lk(g_resumeMtx);
+    auto c = g_resumeCache.find(j.path);
+    if (c != g_resumeCache.end() && c->second.updated == j.updated) c->second.pending = false;
+}
+
+static void ResumeWorker() {
+    for (;;) {
+        ResumeJob j;
+        {
+            std::unique_lock<std::mutex> lk(g_resumeQMtx);
+            g_resumeQCv.wait(lk, [] { return g_resumeStop || !g_resumeQueue.empty(); });
+            if (g_resumeQueue.empty()) break;  // stop requested and nothing left
+            j = g_resumeQueue.front();
+            g_resumeQueue.pop_front();
+            g_resumeBusy = true;
+        }
+        ProcessResumeJob(j);
+        {
+            std::lock_guard<std::mutex> lk(g_resumeQMtx);
+            g_resumeBusy = false;
+        }
+        g_resumeQCv.notify_all();
+    }
+}
+
+// Waits until queued saves are written (used before disconnecting / exit).
+static bool WaitResumeIdle(DWORD ms) {
+    std::unique_lock<std::mutex> lk(g_resumeQMtx);
+    return g_resumeQCv.wait_for(lk, std::chrono::milliseconds(ms),
+                                [] { return g_resumeQueue.empty() && !g_resumeBusy; });
+}
+
+static void QueueResume(const std::string& path, double pos, double dur, bool remove) {
+    if (!g_resumeEnabled || path.empty()) return;
+    ResumeJob j;
+    j.file = g_resumeFile;
+    j.path = path;
+    j.pos = pos;
+    j.duration = dur;
+    j.remove = remove;
+    j.updated = (int64_t)time(nullptr);
+    {
+        std::lock_guard<std::mutex> lk(g_resumeMtx);
+        ResumeEntry& e = g_resumeCache[path];
+        e.pos = pos;
+        e.duration = dur;
+        e.updated = j.updated;
+        e.removed = remove;
+        e.pending = true;
+    }
+    {
+        std::lock_guard<std::mutex> lk(g_resumeQMtx);
+        // Only the latest save of a file matters.
+        g_resumeQueue.erase(std::remove_if(g_resumeQueue.begin(), g_resumeQueue.end(),
+                                           [&](const ResumeJob& q) { return q.path == path; }),
+                            g_resumeQueue.end());
+        g_resumeQueue.push_back(j);
+    }
+    g_resumeQCv.notify_all();
+}
+
+// Re-reads the server file (positions saved by other devices) and merges it
+// with local saves that are not written yet.
+static void RefreshResumeCache() {
+    std::string text, err;
+    bool exists = false;
+    std::map<std::string, ResumeEntry> server;
+    if (!g_browseConn.readTextFile(g_resumeFile, text, exists, err)) {
+        AppLog("resume: cannot read " + g_resumeFile + ": " + err);
+        return;
+    }
+    if (exists) ParseResumeXml(text, server);
+    std::lock_guard<std::mutex> lk(g_resumeMtx);
+    g_resumeCache = MergePendingResume(std::move(server), g_resumeCache);
+}
+
+// Position to resume a remote file at (0 = from the start).
+static double ResumePositionFor(const std::string& path) {
+    if (!g_resumeEnabled) return 0;
+    RefreshResumeCache();
+    std::lock_guard<std::mutex> lk(g_resumeMtx);
+    return ResumeStartFor(g_resumeCache, path);
+}
+
+// Save the position of the playing remote file (finished = reached the end).
+static void ResumeSaveCurrent(bool finished) {
+    if (g_resumeCurPath.empty()) return;
+    double pos = g_resumeCurPos, dur = g_resumeCurDur > 0 ? g_resumeCurDur : g_duration;
+    bool remove = finished || ResumeShouldForget(pos, dur);
+    QueueResume(g_resumeCurPath, pos, dur, remove);
+    g_resumeLastSaved = pos;
+}
+
 static void HandleMpvEvents() {
     while (g_mpvh) {
         mpv_event* ev = g_mpv.wait_event(g_mpvh, 0);
@@ -907,12 +1059,17 @@ static void HandleMpvEvents() {
             std::string name = p->name;
             if (name == "time-pos") {
                 g_timePos = p->format == MPV_FORMAT_DOUBLE ? *(double*)p->data : 0;
+                if (p->format == MPV_FORMAT_DOUBLE && !g_resumeCurPath.empty()) g_resumeCurPos = g_timePos;
             } else if (name == "duration") {
                 g_duration = p->format == MPV_FORMAT_DOUBLE ? *(double*)p->data : 0;
                 g_streamDuration = g_duration;  // lets the prefetcher size its 5 s windows
+                if (p->format == MPV_FORMAT_DOUBLE && !g_resumeCurPath.empty()) g_resumeCurDur = g_duration;
                 ApplyBackBuffer();
             } else if (name == "pause") {
                 g_paused = p->format == MPV_FORMAT_FLAG && *(int*)p->data;
+                // Pausing is a likely moment to continue on another device: save now.
+                if (g_paused && !g_resumeCurPath.empty() && std::fabs(g_resumeCurPos - g_resumeLastSaved) >= 1.0)
+                    ResumeSaveCurrent(false);
             } else if (name == "speed") {
                 if (p->format == MPV_FORMAT_DOUBLE) g_speed = *(double*)p->data;
             } else if (name == "idle-active") {
@@ -959,6 +1116,13 @@ static void HandleMpvEvents() {
         }
         case MPV_EVENT_FILE_LOADED: {
             AppLog("file loaded");
+            g_resumeCurPath = g_resumeLoadingPath;  // remote file whose position is tracked
+            g_resumeLoadingPath.clear();
+            // Until mpv reports a time, the file is at its start position: stopping
+            // right away must not overwrite a saved position with 0.
+            g_resumeCurPos = g_resumeLoadingStart;
+            g_resumeLastSaved = g_resumeLoadingStart;
+            g_resumeCurDur = g_duration;
             // Select the first external subtitle; add the others as choices.
             for (size_t i = 0; i < g_pendingSubs.size(); ++i)
                 Cmd({"sub-add", g_pendingSubs[i], i == 0 ? "select" : "auto"});
@@ -968,6 +1132,9 @@ static void HandleMpvEvents() {
         }
         case MPV_EVENT_END_FILE: {
             auto* e = static_cast<mpv_event_end_file*>(ev->data);
+            // Remember where the file stopped (or forget it when it played to the end).
+            ResumeSaveCurrent(e->reason == MPV_END_FILE_REASON_EOF);
+            g_resumeCurPath.clear();
             if (e->reason == MPV_END_FILE_REASON_EOF) {
                 if (g_plIndex + 1 < (int)g_playlist.size()) PlayIndex(g_plIndex + 1);
                 else SetStatus(L"Finished");
@@ -1044,16 +1211,32 @@ static void PlayIndex(int i) {
     g_pendingSubs = it.subs;
     g_streamDuration = 0;  // unknown until mpv reports the new file's duration
     ResetKeyframeInterval();
+    g_resumeLoadingPath.clear();
+    g_resumeLoadingStart = 0;
+    double resumeAt = 0;
+    // Shift held (Shift+double-click / Shift+Enter): start from the beginning.
+    bool fromStart = GetKeyState(VK_SHIFT) < 0;
     if (it.remote) {
         std::string title = WideToUtf8(it.name);
         // Start playback only once 5 s are buffered (cache-pause-wait).
-        Cmd({"loadfile", it.url, "replace", "-1",
-             "force-media-title=" + MpvQuote(title) + ",cache-pause-initial=yes"});
+        std::string opts = "force-media-title=" + MpvQuote(title) + ",cache-pause-initial=yes";
+        if (g_resumeEnabled) {
+            opts += ",resume-playback=no";  // the server's shared position decides, not mpv's local one
+            g_resumeLoadingPath = it.remotePath;
+            resumeAt = fromStart ? 0 : ResumePositionFor(it.remotePath);  // saved by this or another device
+            g_resumeLoadingStart = resumeAt;
+            if (resumeAt > 0) {
+                char b[48];
+                snprintf(b, sizeof(b), ",start=%.3f", resumeAt);
+                opts += b;
+            }
+        }
+        Cmd({"loadfile", it.url, "replace", "-1", opts});
     } else {
         Cmd({"loadfile", it.url, "replace"});
     }
     SetPropFlag("pause", false);
-    SetStatus(L"Opening: " + it.name);
+    SetStatus((resumeAt > 0 ? L"Resuming at " + FormatTime(resumeAt) + L": " : L"Opening: ") + it.name);
     std::wstring title = std::wstring(kAppName) + L" - " + it.name;
     SetWindowTextW(g_main, title.c_str());
 }
@@ -1484,7 +1667,8 @@ static void PlayFromListing(int entryIdx) {
         it.dir = dirKey;
         if (g_mode == Mode::Remote) {
             it.remote = true;
-            it.url = RemoteUrl(JoinRemote(g_remotePath, e.raw));
+            it.remotePath = JoinRemote(g_remotePath, e.raw);
+            it.url = RemoteUrl(it.remotePath);
             // External subtitles next to the file (same base name).
             std::wstring base = e.name;
             size_t dot = base.rfind(L'.');
@@ -1535,12 +1719,19 @@ static void NavigateTyped() {
 // Connection
 // ---------------------------------------------------------------------------
 static void Disconnect() {
+    // Write the current position before the connection goes away.
+    ResumeSaveCurrent(false);
+    g_resumeCurPath.clear();
+    g_resumeLoadingPath.clear();
+    WaitResumeIdle(5000);
+    g_resumeEnabled = false;
     bool remotePlaying = g_plIndex >= 0 && g_plIndex < (int)g_playlist.size() && g_playlist[g_plIndex].remote;
     if (remotePlaying) StopPlayback();
     g_streamConn.disconnect();
     g_browseConn.disconnect();
     g_connected = false;
     g_remoteIsWindows = false;
+    g_remoteIsUnix = false;
     g_remoteWinPaths = false;
     g_remoteHome.clear();
     g_remoteOs.clear();
@@ -1577,6 +1768,7 @@ static void DetectRemoteSystem() {
     }
     if (g_remoteIsWindows) g_remoteOs = L"Windows";
     else g_remoteOs = Utf8ToWide(os);
+    g_remoteIsUnix = hasUname && !IsWindowsUname(os) && !g_remoteIsWindows;
     AppLog("remote system: " + (hasUname ? (os.empty() ? std::string("?") : os) : std::string("no uname")) +
            (g_remoteIsWindows ? " (Windows)" : "") + ", home: " + (g_remoteHome.empty() ? std::string("/") : g_remoteHome));
 }
@@ -1623,6 +1815,22 @@ static void Connect() {
     IniSet(L"backend", connKey.c_str(), p.backend == kBackendPowerShell ? L"powershell" : L"sh");
     DetectRemoteSystem();
     g_remoteWinPaths = g_remoteIsWindows && p.backend == kBackendPowerShell;
+    // Shared resume positions: only for Unix servers, in the home folder there.
+    g_resumeEnabled = g_remoteIsUnix && p.backend == kBackendSh && !g_remoteHome.empty() &&
+                      IniGetInt(L"main", L"resume", 1) != 0;
+    {
+        std::lock_guard<std::mutex> lk(g_resumeMtx);
+        g_resumeCache.clear();
+    }
+    if (g_resumeEnabled) {
+        g_resumeFile = JoinRemote(g_remoteHome, kResumeFileName);
+        RefreshResumeCache();
+        std::lock_guard<std::mutex> lk(g_resumeMtx);
+        AppLog("resume: using " + g_resumeFile + " (" + std::to_string(g_resumeCache.size()) + " saved positions)");
+    } else {
+        AppLog("resume: off for this server (only Unix servers keep shared positions)");
+    }
+    SetConnStatus();
     AppLog(std::string("remote shell: ") + (p.backend == kBackendPowerShell ? "PowerShell" : "sh"));
     SetWindowTextW(g_connectBtn, L"Disconnect");
     SetConnStatus();
@@ -2285,6 +2493,11 @@ static LRESULT CALLBACK MainProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         if (!files.empty()) PlayLocalFiles(files);
         return 0;
     }
+    case WM_TIMER:
+        if (wp == kResumeTimer && !g_resumeCurPath.empty() && !g_paused && !g_idle &&
+            std::fabs(g_resumeCurPos - g_resumeLastSaved) >= 5.0)
+            ResumeSaveCurrent(false);  // periodic save while playing
+        return 0;
     case WM_MPV_WAKEUP:
         HandleMpvEvents();
         return 0;
@@ -2299,6 +2512,16 @@ static LRESULT CALLBACK MainProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                                         std::to_wstring(r.right) + L"," + std::to_wstring(r.bottom) + L"," +
                                         (wp2.showCmd == SW_SHOWMAXIMIZED ? L"1" : L"0"));
         }
+        // Save the position of the playing remote file, then stop the saver.
+        ResumeSaveCurrent(false);
+        g_resumeCurPath.clear();
+        bool idle = WaitResumeIdle(5000);
+        {
+            std::lock_guard<std::mutex> lk(g_resumeQMtx);
+            g_resumeStop = true;
+        }
+        g_resumeQCv.notify_all();
+        if (g_resumeThread.joinable()) { if (idle) g_resumeThread.join(); else g_resumeThread.detach(); }
         // Make blocked stream reads fail fast, then shut mpv down.
         g_streamConn.disconnect();
         g_browseConn.disconnect();
@@ -2421,6 +2644,9 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
     if (argv) LocalFree(argv);
     if (!files.empty()) PlayLocalFiles(files);
     SetFocus(g_main);
+
+    g_resumeThread = std::thread(ResumeWorker);
+    SetTimer(g_main, kResumeTimer, kResumeTimerMs, nullptr);
 
     MSG m;
     while (GetMessageW(&m, nullptr, 0, 0) > 0) {

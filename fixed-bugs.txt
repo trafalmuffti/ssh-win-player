@@ -105,3 +105,12 @@ Fixed bugs
            early). Result: the same -10 s seek restarted in 0.44 s with no server access.
   Note:    the 2026-11-15 buffering entry's "resumed 0.24 s after the seek" was measured with
            the seek target already buffered; it did not cover this keyframe case.
+
+2026-11-20  Resume positions (new feature) - bugs found in review before release
+  1. Symptom: stopping a resumed video right after it opened would have deleted its saved
+     position. Cause: the tracked position started at 0 until mpv reported a time, and 0 counts as
+     "barely started" (forget). Fix: tracking starts at the resume position.
+  2. Symptom: "nearly finished" could go undetected. Cause: the duration was reset when the file
+     was loaded, after mpv might already have reported it. Fix: fall back to the current duration.
+  3. Symptom: mpv's own local "watch later" resume could override the shared server position.
+     Fix: remote files are loaded with resume-playback=no; the server position is passed as start=.
