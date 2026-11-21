@@ -114,3 +114,17 @@ Fixed bugs
      was loaded, after mpv might already have reported it. Fix: fall back to the current duration.
   3. Symptom: mpv's own local "watch later" resume could override the shared server position.
      Fix: remote files are loaded with resume-playback=no; the server position is passed as start=.
+
+2026-11-21  No pop-up when an established SSH connection failed
+  Symptom: when the server became unreachable while browsing, only the status bar changed (and a
+           beep); during playback the video just stopped with "Cannot play ..." in the status bar.
+           A connection that died while idle went unnoticed until the next click.
+  Cause:   SshConn retried silently and reported failures only as return values; the UI never
+           told the user the connection itself was gone.
+  Fix:     SshConn now has a lost callback, fired only when a connection that had worked broke
+           and the automatic reconnect failed (not for a failed first connect or after
+           Disconnect). An unexpected ssh exit triggers an immediate reconnect attempt. The UI
+           shows "SSH connection reset" (with ssh's error) - Retry reconnects and continues the
+           video at its saved position, Cancel stays disconnected. Resume saves that failed during
+           the outage are kept and written after reconnecting (also visible to the resume lookup).
+           NOT tested in the GUI: Wine does not start on this build machine's kernel.
