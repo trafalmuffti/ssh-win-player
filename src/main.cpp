@@ -124,10 +124,15 @@ struct PlayItem {
     std::wstring dir;  // folder it came from (for highlighting)
     bool remote = false;
     std::string remotePath;  // server path (remote items), key for resume positions
+    bool archive = false;    // zip / rar / 7z: mpv expands it into the media files inside
     std::vector<std::string> subs;
 };
 static std::vector<PlayItem> g_playlist;
 static int g_plIndex = -1;
+static int64_t g_mpvPlPos = -1, g_mpvPlCount = 0;  // mpv's own playlist (entries of an opened archive)
+static bool g_archiveSession = false;   // the current item is an archive
+static bool g_archiveFiltered = false;  // its non-media entries were removed from mpv's playlist
+static bool g_archiveFromStart = false; // Shift: ignore saved positions inside this archive
 static int g_remotePlayIndex = -1;  // remote item last started; kept through connection errors (for Retry)
 static std::vector<std::string> g_pendingSubs;
 
@@ -191,6 +196,28 @@ static const wchar_t* const kSubExt[] = {L"srt", L"ass", L"ssa", L"vtt", L"sub",
 
 static bool IsMedia(const std::wstring& name) { return InList(LowerExt(name), kMediaExt); }
 static bool IsSub(const std::wstring& name) { return InList(LowerExt(name), kSubExt); }
+
+// Archives: libmpv-2.dll is built with libarchive, so mpv opens these itself
+// and plays the media files inside (ZIP, RAR incl. RAR5 and multi-part sets,
+// 7-Zip).
+static const wchar_t* const kArchiveExt[] = {L"zip", L"rar", L"7z", nullptr};
+
+// "Movie.part2.rar", "Movie.part03.rar": later parts of a multi-part RAR set.
+// Only the first part is opened (mpv finds the others next to it).
+static bool IsFollowUpVolume(const std::wstring& name) {
+    std::wstring n = name;
+    CharLowerBuffW(&n[0], (DWORD)n.size());
+    if (n.size() < 10 || n.compare(n.size() - 4, 4, L".rar") != 0) return false;
+    size_t part = n.rfind(L".part", n.size() - 4);
+    if (part == std::wstring::npos) return false;
+    std::wstring digits = n.substr(part + 5, n.size() - 4 - (part + 5));
+    if (digits.empty() || digits.find_first_not_of(L"0123456789") != std::wstring::npos) return false;
+    return _wtoi(digits.c_str()) != 1;
+}
+
+static bool IsArchive(const std::wstring& name) { return InList(LowerExt(name), kArchiveExt) && !IsFollowUpVolume(name); }
+// Shown in the "media only" list and used in the folder playlist.
+static bool IsPlayable(const std::wstring& name) { return IsMedia(name) || IsArchive(name); }
 
 static std::string PercentEncode(const std::string& s) {
     static const char* hex = "0123456789ABCDEF";
@@ -776,10 +803,66 @@ static void ShowPlayingStatus() {
     if (g_plIndex >= 0 && g_plIndex < (int)g_playlist.size()) {
         wchar_t b[64];
         swprintf(b, 64, L"  [%d/%d]", g_plIndex + 1, (int)g_playlist.size());
-        SetStatus(L"Playing: " + g_playlist[g_plIndex].name + b);
+        std::wstring s = L"Playing: " + g_playlist[g_plIndex].name;
+        if (g_archiveSession && g_mpvPlCount > 0 && !g_mediaTitle.empty()) {
+            wchar_t e[48];
+            swprintf(e, 48, L" (%lld/%lld)", (long long)g_mpvPlPos + 1, (long long)g_mpvPlCount);
+            s += L" \u203A " + g_mediaTitle + e;  // "Show.zip > Episode 01.mkv (1/2)"
+        }
+        SetStatus(s + b);
+    }
+}
+
+// mpv property as a UTF-8 string ("" if unavailable).
+static std::string MpvString(const char* name) {
+    if (!g_mpvh || !g_mpv.get_property_string) return "";
+    char* v = g_mpv.get_property_string(g_mpvh, name);
+    std::string r = v ? v : "";
+    if (v) g_mpv.free(v);
+    return r;
+}
+
+// "archive://<archive url>|/<entry>" -> "<entry>"
+static std::string ArchiveEntryOf(const std::string& path) {
+    size_t bar = path.rfind("|/");
+    return bar == std::string::npos ? path : path.substr(bar + 2);
+}
+
+// mpv lists every entry of an archive (sorted by name), including .nfo, .txt
+// and pictures.  When the first entry starts, remove the ones that are not
+// video / audio (from the end, so indexes stay valid), so the archive's
+// entry count is right for next / previous / auto-advance.  Verified with mpv
+// (zip, 7z, multi-part rar, local and over a seekable network stream).
+static void FilterArchivePlaylist() {
+    g_archiveFiltered = true;
+    std::string cur = MpvString("playlist-pos");
+    std::string cnt = MpvString("playlist-count");
+    int pos = cur.empty() ? -1 : atoi(cur.c_str());
+    int n = cnt.empty() ? 0 : atoi(cnt.c_str());
+    int media = 0;
+    for (int i = n - 1; i >= 0; --i) {
+        std::string key = "playlist/" + std::to_string(i) + "/filename";
+        std::wstring entry = Utf8ToWide(ArchiveEntryOf(MpvString(key.c_str())));
+        if (IsMedia(entry)) { ++media; continue; }
+        if (i == pos) continue;  // handled below
+        std::string idx = std::to_string(i);
+        const char* a[] = {"playlist-remove", idx.c_str(), nullptr};
+        g_mpv.command(g_mpvh, a);
+    }
+    if (media == 0) {
+        SetStatus(L"No video or audio files in " +
+                  (g_plIndex >= 0 && g_plIndex < (int)g_playlist.size() ? g_playlist[g_plIndex].name : L"the archive"));
+    }
+    AppLog("archive: " + std::to_string(n) + " entries, " + std::to_string(media) + " video/audio");
+    std::wstring curEntry = Utf8ToWide(ArchiveEntryOf(MpvString("path")));
+    if (!IsMedia(curEntry)) {
+        const char* a[] = {"playlist-remove", "current", nullptr};  // skips to the next entry
+        g_mpv.command(g_mpvh, a);
     }
 }
 static void PlayIndex(int i);
+static void PlayNext();
+static void PlayPrev();
 static void StopPlayback();
 static void ApplyFullscreen(bool fs);
 
@@ -845,6 +928,8 @@ static bool InitMpv(std::string& err) {
     g_mpv.observe_property(g_mpvh, 0, "paused-for-cache", MPV_FORMAT_FLAG);
     g_mpv.observe_property(g_mpvh, 0, "cache-buffering-state", MPV_FORMAT_INT64);
     g_mpv.observe_property(g_mpvh, 0, "track-list", MPV_FORMAT_NODE);
+    g_mpv.observe_property(g_mpvh, 0, "playlist-pos", MPV_FORMAT_INT64);
+    g_mpv.observe_property(g_mpvh, 0, "playlist-count", MPV_FORMAT_INT64);
     g_mpv.observe_property(g_mpvh, 0, "file-size", MPV_FORMAT_INT64);
     g_mpv.observe_property(g_mpvh, 0, "video-frame-info/picture-type", MPV_FORMAT_STRING);
     g_mpv.observe_property(g_mpvh, 0, "frame-drop-count", MPV_FORMAT_INT64);
@@ -1153,9 +1238,14 @@ static void HandleMpvEvents() {
                 ApplyBackBuffer();
             } else if (name == "track-list") {
                 ParseTrackList(p->format == MPV_FORMAT_NODE ? static_cast<mpv_node*>(p->data) : nullptr);
+            } else if (name == "playlist-pos") {
+                g_mpvPlPos = p->format == MPV_FORMAT_INT64 ? *(int64_t*)p->data : -1;
+            } else if (name == "playlist-count") {
+                g_mpvPlCount = p->format == MPV_FORMAT_INT64 ? *(int64_t*)p->data : 0;
             } else if (name == "media-title") {
                 g_mediaTitle = p->format == MPV_FORMAT_STRING ? Utf8ToWide(*(char**)p->data) : L"";
                 InvalidateRect(g_video, nullptr, TRUE);
+                if (g_archiveSession && !g_idle) ShowPlayingStatus();  // entry name inside the archive
             }
             break;
         }
@@ -1168,6 +1258,22 @@ static void HandleMpvEvents() {
             g_resumeCurPos = g_resumeLoadingStart;
             g_resumeLastSaved = g_resumeLoadingStart;
             g_resumeCurDur = g_duration;
+            // Inside a remote archive: positions are kept per entry ("<archive>|/<entry>").
+            if (g_archiveSession && g_resumeEnabled && g_remotePlayIndex >= 0 &&
+                g_remotePlayIndex < (int)g_playlist.size()) {
+                std::string path = MpvString("path");
+                if (path.compare(0, 10, "archive://") == 0) {
+                    g_resumeCurPath = g_playlist[g_remotePlayIndex].remotePath + "|/" + ArchiveEntryOf(path);
+                    double at = g_archiveFromStart ? 0 : ResumePositionFor(g_resumeCurPath);
+                    g_resumeCurPos = g_resumeLastSaved = at;
+                    if (at > 0) {
+                        char b[32];
+                        snprintf(b, sizeof(b), "%.3f", at);
+                        Cmd({"seek", b, "absolute"});
+                        SetStatus(L"Resuming at " + FormatTime(at) + L": " + Utf8ToWide(ArchiveEntryOf(path)));
+                    }
+                }
+            }
             // Select the first external subtitle; add the others as choices.
             for (size_t i = 0; i < g_pendingSubs.size(); ++i)
                 Cmd({"sub-add", g_pendingSubs[i], i == 0 ? "select" : "auto"});
@@ -1180,7 +1286,9 @@ static void HandleMpvEvents() {
             // Remember where the file stopped (or forget it when it played to the end).
             ResumeSaveCurrent(e->reason == MPV_END_FILE_REASON_EOF);
             g_resumeCurPath.clear();
-            if (e->reason == MPV_END_FILE_REASON_EOF) {
+            if (e->reason == MPV_END_FILE_REASON_EOF && g_mpvPlPos >= 0 && g_mpvPlPos + 1 < g_mpvPlCount) {
+                // More entries in the opened archive: mpv plays the next one itself.
+            } else if (e->reason == MPV_END_FILE_REASON_EOF) {
                 if (g_plIndex + 1 < (int)g_playlist.size()) PlayIndex(g_plIndex + 1);
                 else { SetStatus(L"Finished"); g_remotePlayIndex = -1; }
             } else if (e->reason == MPV_END_FILE_REASON_ERROR) {
@@ -1193,13 +1301,17 @@ static void HandleMpvEvents() {
             auto* m = static_cast<mpv_event_client_message*>(ev->data);
             if (m->num_args >= 1) {
                 std::string a = m->args[0];
-                if (a == "swp-next") { if (g_plIndex + 1 < (int)g_playlist.size()) PlayIndex(g_plIndex + 1); }
-                else if (a == "swp-prev") { if (g_plIndex > 0) PlayIndex(g_plIndex - 1); }
+                if (a == "swp-next") PlayNext();
+                else if (a == "swp-prev") PlayPrev();
                 else if (a == "swp-stop") StopPlayback();
                 else if (a == "swp-help") OpenHotkeyHelp();
             }
             break;
         }
+        case MPV_EVENT_START_FILE:
+            if (g_archiveSession && !g_archiveFiltered && MpvString("path").compare(0, 10, "archive://") == 0)
+                FilterArchivePlaylist();
+            break;
         case MPV_EVENT_SEEK:
             AppLog("seek");
             g_lastIFrameTime = -1;  // do not measure a keyframe gap across a seek
@@ -1262,11 +1374,19 @@ static void PlayIndex(int i) {
     double resumeAt = 0;
     // Shift held (Shift+double-click / Shift+Enter): start from the beginning.
     bool fromStart = GetKeyState(VK_SHIFT) < 0;
+    g_archiveSession = it.archive;
+    g_archiveFiltered = false;
+    g_archiveFromStart = fromStart;
     if (it.remote) {
         std::string title = WideToUtf8(it.name);
         // Start playback only once 5 s are buffered (cache-pause-wait).
-        std::string opts = "force-media-title=" + MpvQuote(title) + ",cache-pause-initial=yes";
-        if (g_resumeEnabled) {
+        // Archives: no forced title (each entry shows its own name) and positions are
+        // handled per entry at FILE_LOADED instead of start=.
+        std::string opts = it.archive ? std::string("cache-pause-initial=yes")
+                                      : "force-media-title=" + MpvQuote(title) + ",cache-pause-initial=yes";
+        if (g_resumeEnabled && it.archive) {
+            opts += ",resume-playback=no";
+        } else if (g_resumeEnabled) {
             opts += ",resume-playback=no";  // the server's shared position decides, not mpv's local one
             g_resumeLoadingPath = it.remotePath;
             resumeAt = fromStart ? 0 : ResumePositionFor(it.remotePath);  // saved by this or another device
@@ -1287,6 +1407,16 @@ static void PlayIndex(int i) {
     SetWindowTextW(g_main, title.c_str());
 }
 
+// Next / previous: within an opened archive first, then the folder playlist.
+static void PlayNext() {
+    if (g_archiveSession && !g_idle && g_mpvPlPos >= 0 && g_mpvPlPos + 1 < g_mpvPlCount) { Cmd({"playlist-next"}); return; }
+    if (g_plIndex + 1 < (int)g_playlist.size()) PlayIndex(g_plIndex + 1);
+}
+static void PlayPrev() {
+    if (g_archiveSession && !g_idle && g_mpvPlPos > 0) { Cmd({"playlist-prev"}); return; }
+    if (g_plIndex > 0) PlayIndex(g_plIndex - 1);
+}
+
 static void StopPlayback() {
     g_remotePlayIndex = -1;  // stopped on purpose: nothing to continue after a reconnect
     Cmd({"stop"});
@@ -1301,6 +1431,7 @@ static void PlayLocalFiles(const std::vector<std::wstring>& files) {
         it.url = WideToUtf8(f);
         size_t s = f.find_last_of(L"\\/");
         it.name = s == std::wstring::npos ? f : f.substr(s + 1);
+        it.archive = IsArchive(it.name);
         it.dir = s == std::wstring::npos ? L"" : f.substr(0, s);
         g_playlist.push_back(it);
     }
@@ -1524,7 +1655,7 @@ static void FillList(const std::wstring& selectName = L"") {
         playing = g_playlist[g_plIndex].name;
     for (int i = 0; i < (int)g_entries.size(); ++i) {
         const Entry& e = g_entries[i];
-        if (!all && !e.isDir && !e.isUp && !IsMedia(e.name)) continue;
+        if (!all && !e.isDir && !e.isUp && !IsPlayable(e.name)) continue;
         int row = (int)g_shown.size();
         g_shown.push_back(i);
         LVITEMW it{};
@@ -1698,8 +1829,9 @@ static void PlayFromListing(int entryIdx) {
     const Entry& sel = g_entries[entryIdx];
     std::wstring dirKey = CurrentDirKey();
     std::vector<int> items;
-    if (IsMedia(sel.name)) {
-        for (int i : g_shown) if (!g_entries[i].isDir && !g_entries[i].isUp && IsMedia(g_entries[i].name)) items.push_back(i);
+    if (IsPlayable(sel.name)) {
+        // Folder playlist: media files and archives (only the first part of a RAR set).
+        for (int i : g_shown) if (!g_entries[i].isDir && !g_entries[i].isUp && IsPlayable(g_entries[i].name)) items.push_back(i);
     } else {
         items.push_back(entryIdx);
     }
@@ -1710,6 +1842,7 @@ static void PlayFromListing(int entryIdx) {
         PlayItem it;
         it.name = e.name;
         it.dir = dirKey;
+        it.archive = IsArchive(e.name);
         if (g_mode == Mode::Remote) {
             it.remote = true;
             it.remotePath = JoinRemote(g_remotePath, e.raw);
@@ -2390,7 +2523,9 @@ static void OpenFilesDialog() {
     ofn.hwndOwner = g_main;
     ofn.lpstrFilter =
         L"Media files\0*.mkv;*.mp4;*.m4v;*.avi;*.mov;*.wmv;*.flv;*.webm;*.mpg;*.mpeg;*.ts;*.m2ts;*.mts;*.vob;*.ogv;*.3gp;"
-        L"*.mp3;*.flac;*.wav;*.ogg;*.opus;*.m4a;*.m4b;*.aac;*.wma;*.ape;*.wv;*.mka;*.aiff;*.dsf;*.ac3;*.dts\0"
+        L"*.mp3;*.flac;*.wav;*.ogg;*.opus;*.m4a;*.m4b;*.aac;*.wma;*.ape;*.wv;*.mka;*.aiff;*.dsf;*.ac3;*.dts;"
+        L"*.zip;*.rar;*.7z\0"
+        L"Archives (zip, rar, 7z)\0*.zip;*.rar;*.7z\0"
         L"All files\0*.*\0";
     ofn.lpstrFile = buf.data();
     ofn.nMaxFile = (DWORD)buf.size();
@@ -2434,8 +2569,8 @@ static void OnCommand(int id, int code) {
             FillList();
         }
         break;
-    case IDC_BTN_PREV: if (g_plIndex > 0) PlayIndex(g_plIndex - 1); break;
-    case IDC_BTN_NEXT: if (g_plIndex + 1 < (int)g_playlist.size()) PlayIndex(g_plIndex + 1); break;
+    case IDC_BTN_PREV: PlayPrev(); break;
+    case IDC_BTN_NEXT: PlayNext(); break;
     case IDC_BTN_BACK60: SeekRel(-60); break;
     case IDC_BTN_BACK10: SeekRel(-10); break;
     case IDC_BTN_FWD10: SeekRel(10); break;

@@ -24,6 +24,7 @@ struct MpvApi {
     decltype(&::mpv_set_wakeup_callback) set_wakeup_callback = nullptr;
     decltype(&::mpv_error_string) error_string = nullptr;
     decltype(&::mpv_free) free = nullptr;
+    decltype(&::mpv_get_property_string) get_property_string = nullptr;
     decltype(&::mpv_request_log_messages) request_log_messages = nullptr;
     decltype(&::mpv_stream_cb_add_ro) stream_cb_add_ro = nullptr;
 
@@ -50,6 +51,7 @@ struct MpvApi {
         MPV_LOAD(set_wakeup_callback, "mpv_set_wakeup_callback")
         MPV_LOAD(error_string, "mpv_error_string")
         MPV_LOAD(free, "mpv_free")
+        MPV_LOAD(get_property_string, "mpv_get_property_string")
         MPV_LOAD(request_log_messages, "mpv_request_log_messages")
         MPV_LOAD(stream_cb_add_ro, "mpv_stream_cb_add_ro")
 #undef MPV_LOAD

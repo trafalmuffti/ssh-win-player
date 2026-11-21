@@ -40,6 +40,23 @@ stored with Git LFS: on GitHub use the file's **Download** (raw) button; when cl
 
 Matching subtitles (`movie.srt` next to `movie.mkv`) are loaded automatically.
 
+### ZIP, RAR and 7-Zip archives
+
+Archives (`.zip`, `.rar`, `.7z`) show up in the file list next to videos and can be opened like a
+video, on the server or locally; nothing is unpacked to disk. The player plays the video and audio
+files inside in name order and skips everything else (`.nfo`, `.txt`, pictures).
+**Next / Previous** (and `>` / `<`) move between the files inside the archive first, then to the
+next file in the folder; the status bar shows e.g. `Show S01.zip › Episode 01.mkv (1/2)`.
+Saved positions work per file inside an archive.
+
+- **Multi-part RAR sets** (`Movie.part1.rar`, `Movie.part2.rar`, …): open the first part; the
+  others are found automatically and hidden from the list. Usually a set holds one video. If
+  a set holds several, only the files that start in the first part are listed (a libarchive
+  limitation). Old-style sets (`Movie.rar`, `Movie.r00`, …) are untested.
+- Not supported: password-protected archives and "solid" RAR4 archives.
+- Seeking is fast in archives stored without compression (the usual case for video). In
+  compressed archives, a jump may have to decompress from the start of the file.
+
 ### Resume on any device (Unix servers)
 
 On Linux / BSD / macOS / NAS servers, the playback position of every remote video is saved in

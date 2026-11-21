@@ -42,6 +42,12 @@ Key design points:
   (and the connection had worked: everConnected_) it calls the lost callback -> WM_SSH_LOST ->
   OnConnectionLost: "SSH connection reset" dialog, Disconnect(false), Retry = Connect() + replay
   g_remotePlayIndex. Failed resume saves are kept (g_resumeFailed) and requeued on connect.
+- Archives (zip/rar/7z): libmpv-2.dll is built with libarchive (-Dlibarchive=enabled). mpv expands an
+  archive into its entries (sorted by name, "archive://<url>|/<entry>", incl. non-media). On the
+  first START_FILE of an archive item, FilterArchivePlaylist removes non-media entries (descending,
+  current last). PlayNext/PlayPrev and EOF auto-advance use mpv's playlist-pos/count first.
+  Multi-part RAR: only .part1 listed (IsFollowUpVolume), mpv opens the other volumes via the same
+  protocol. Resume key inside archives: "<archive path>|/<entry>" (seek at FILE_LOADED).
 - Shared resume (Unix servers only, g_resumeEnabled): ~/.ssh-win-player-positions.xml on the server.
   Format + merge rules in src/resume_xml.h (no Windows headers; unit test: `g++ -std=c++17 -I src
   tests/resume_test.cpp -o /tmp/rt && /tmp/rt`). Saves go through a worker thread (QueueResume ->
