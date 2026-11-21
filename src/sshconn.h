@@ -43,6 +43,10 @@ public:
     SshConn& operator=(const SshConn&) = delete;
 
     void setParams(const SshParams& p);
+    // Called (from any thread) when an established connection broke and could
+    // not be restored automatically.  Not called for a failed first connect()
+    // or after disconnect().
+    void setLostCallback(std::function<void(const std::string&)> cb) { onLost_ = std::move(cb); }
     // Starts (or restarts) the ssh process.  Thread safe.
     bool connect(std::string& err);
     // Kills the ssh process.  Safe to call while another thread is blocked
@@ -100,6 +104,10 @@ private:
     bool haveParams_ = false;
     std::atomic<bool> enabled_{false};
     int activeBackend_ = 0;
+    std::function<void(const std::string&)> onLost_;
+    bool everConnected_ = false;      // a connection worked since the last connect()/disconnect()
+    std::atomic<bool> armed_{false};  // ssh exiting now would be unexpected
+    void notifyLostLocked(const std::string& err);
     HANDLE proc_ = nullptr;
     std::atomic<HANDLE> procForKill_{nullptr};
     HANDLE inW_ = nullptr;   // our end of ssh stdin

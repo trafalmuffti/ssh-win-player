@@ -15,7 +15,7 @@ Local files are supported too.
 - `src/mpv_dyn.h`  – runtime loader for libmpv-2.dll (headers in third_party/mpv-include)
 - `res/`           – manifest, icon, version resource
 - `build.sh`       – cross-compile with mingw-w64 on Linux → build/SshWinPlayer.exe
-- `release/`       – prebuilt exe + zip with libmpv-2.dll
+- `release/`       – prebuilt SshWinPlayer.exe + libmpv-2.dll (Git LFS: >100 MB)
 
 Key design points:
 - Remote files are fed to mpv through a custom stream protocol `sshwp://<percent-encoded path>`
@@ -37,6 +37,11 @@ Key design points:
   ignored) and assumed 10 s until a longer one is seen: data pruned before measuring is lost.
 - Seek bar hover tip (SeekProc / UpdateSeekTip): tracking tooltip with time under cursor and
   offset from the current position, updated live.
+- Connection loss: SshConn reconnects silently (withRetry / readPipelined, and at once when ssh
+  exits unexpectedly: errThread sees stderr close while armed_). Only if that reconnect fails
+  (and the connection had worked: everConnected_) it calls the lost callback -> WM_SSH_LOST ->
+  OnConnectionLost: "SSH connection reset" dialog, Disconnect(false), Retry = Connect() + replay
+  g_remotePlayIndex. Failed resume saves are kept (g_resumeFailed) and requeued on connect.
 - Shared resume (Unix servers only, g_resumeEnabled): ~/.ssh-win-player-positions.xml on the server.
   Format + merge rules in src/resume_xml.h (no Windows headers; unit test: `g++ -std=c++17 -I src
   tests/resume_test.cpp -o /tmp/rt && /tmp/rt`). Saves go through a worker thread (QueueResume ->

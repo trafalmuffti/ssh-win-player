@@ -100,6 +100,15 @@ If a Windows server *does* have a POSIX shell (Git Bash, MSYS2, Cygwin, busybox-
 script is used; if `dd` is missing there (e.g. when Coreutils' tools come first on the PATH), file
 data is read with `tail -c | head -c` instead.
 
+### If the connection drops
+
+A short interruption is handled silently: the app reconnects and continues. If the server cannot
+be reached again, a message **"SSH connection reset"** appears with the reason from ssh. **Retry**
+reconnects, reopens the folder and continues the video that was playing at its saved position;
+**Cancel** stays disconnected. Positions that could not be saved during the outage are written
+after reconnecting. A dead network is noticed within about 45 seconds (ssh keep-alive); a closed
+connection immediately.
+
 ## Troubleshooting
 
 - A log is written to `%APPDATA%\SshWinPlayer\log.txt` (ssh errors, mpv warnings).

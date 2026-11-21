@@ -281,10 +281,12 @@ bool SshConn::hasParams() {
 
 bool SshConn::connect(std::string& err) {
     enabled_ = true;
+    armed_ = false;
     HANDLE h = procForKill_.load();
     if (h) TerminateProcess(h, 1);
     std::lock_guard<std::mutex> lk(mtx_);
     stopLocked();
+    everConnected_ = false;  // a failed first connect is reported by the caller, not as "lost"
     return startLocked(err);
 }
 
@@ -292,10 +294,18 @@ void SshConn::disconnect() {
     // Kill first (without the lock) so a reader blocked in ReadFile wakes up
     // and releases the lock.
     enabled_ = false;
+    armed_ = false;
     HANDLE h = procForKill_.load();
     if (h) TerminateProcess(h, 1);
     std::lock_guard<std::mutex> lk(mtx_);
     stopLocked();
+    everConnected_ = false;
+}
+
+void SshConn::notifyLostLocked(const std::string& err) {
+    if (!everConnected_ || !enabled_) return;
+    AppLog("connection lost and could not be restored: " + err);
+    if (onLost_) onLost_(err);
 }
 
 bool SshConn::isConnected() {
@@ -313,6 +323,7 @@ std::string SshConn::lastStderr() {
 }
 
 void SshConn::stopLocked() {
+    armed_ = false;  // we are ending the process ourselves
     if (inW_) {
         // Polite shutdown if still alive.
         if (proc_ && WaitForSingleObject(proc_, 0) == WAIT_TIMEOUT && !broken_) {
@@ -371,6 +382,8 @@ bool SshConn::startLocked(std::string& err) {
     for (int i = 0; i < 2; ++i) {
         if (launchLocked(order[i], errs[i])) {
             activeBackend_ = order[i];
+            everConnected_ = true;
+            armed_ = true;  // from now on an exit of ssh is a connection failure
             return true;
         }
         if (IsFatalSshError(errs[i])) { err = errs[i]; return false; }
@@ -474,6 +487,21 @@ bool SshConn::launchLocked(int backend, std::string& err) {
                 pending.erase(0, nl + 1);
             }
         }
+        // stderr closed: ssh has exited.  If that was not our doing, the
+        // connection was reset (network drop, server restart, keep-alive
+        // timeout).  Reconnect right away instead of waiting for the next
+        // request, and report it if that fails.
+        if (armed_.exchange(false) && enabled_) {
+            AppLog("ssh exited unexpectedly, reconnecting");
+            std::thread([this]() {
+                std::lock_guard<std::mutex> lk(mtx_);
+                if (!enabled_ || !everConnected_ || aliveLocked()) return;  // already handled
+                stopLocked();
+                std::string e;
+                if (startLocked(e)) AppLog("reconnected");
+                else notifyLostLocked(e);
+            }).detach();
+        }
     });
 
     std::string logCmd = WideToUtf8(cmd);
@@ -568,7 +596,7 @@ bool SshConn::withRetry(F&& f, std::string& err) {
         if (!aliveLocked()) {
             stopLocked();
             if (!enabled_) { err = "Not connected"; return false; }
-            if (!startLocked(err)) return false;
+            if (!startLocked(err)) { notifyLostLocked(err); return false; }
         }
         int r = f();
         if (r == 1) return true;
@@ -749,7 +777,7 @@ int SshConn::readPipelined(const std::string& path, int64_t len, int depth, int 
         stopLocked();
         if (!enabled_) return -1;
         std::string err;
-        if (!startLocked(err)) return -1;
+        if (!startLocked(err)) { notifyLostLocked(err); return -1; }
     }
     std::vector<char> buf((size_t)len);
     std::deque<int64_t> queue;

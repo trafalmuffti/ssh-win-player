@@ -45,6 +45,7 @@ static const wchar_t* kVideoClass = L"SshWinPlayerVideo";
 static const char* kScheme = "sshwp";
 static const UINT WM_MPV_WAKEUP = WM_APP + 1;
 static const UINT WM_STREAM_READY = WM_APP + 2;
+static const UINT WM_SSH_LOST = WM_APP + 3;  // lParam: std::string* with ssh's error (owned by receiver)
 static const double kWheelSeek = 5.0;       // seconds per wheel notch
 static const double kWheelSeekShift = 30.0; // with Shift held
 
@@ -127,6 +128,7 @@ struct PlayItem {
 };
 static std::vector<PlayItem> g_playlist;
 static int g_plIndex = -1;
+static int g_remotePlayIndex = -1;  // remote item last started; kept through connection errors (for Retry)
 static std::vector<std::string> g_pendingSubs;
 
 // ---------------------------------------------------------------------------
@@ -619,6 +621,7 @@ static const char* kBindings =
 static void UpdateUiFromState();
 static bool g_buffering = false;
 
+
 // Tracks of the current file (from mpv's "track-list"), for the Subs / Audio menus.
 struct Track {
     int64_t id = 0;
@@ -939,19 +942,21 @@ static std::thread g_resumeThread;
 
 
 
-static void ProcessResumeJob(const ResumeJob& j) {
+static std::vector<ResumeJob> g_resumeFailed;  // saves that failed (connection lost); guarded by g_resumeQMtx
+
+static bool ProcessResumeJob(const ResumeJob& j) {
     std::string text, err;
     bool exists = false;
     if (!g_browseConn.readTextFile(j.file, text, exists, err)) {
         AppLog("resume: cannot read " + j.file + ": " + err);
-        return;
+        return false;
     }
     std::map<std::string, ResumeEntry> m;
     if (exists) ParseResumeXml(text, m);
     ApplyResumeChange(m, j.path, j.pos, j.duration, j.remove, j.updated);
     if (!g_browseConn.writeTextFile(j.file, BuildResumeXml(m), err)) {
         AppLog("resume: cannot write " + j.file + ": " + err);
-        return;
+        return false;
     }
     char b[64];
     snprintf(b, sizeof(b), j.remove ? "resume: cleared " : "resume: saved %.1f s ", j.pos);
@@ -959,6 +964,7 @@ static void ProcessResumeJob(const ResumeJob& j) {
     std::lock_guard<std::mutex> lk(g_resumeMtx);
     auto c = g_resumeCache.find(j.path);
     if (c != g_resumeCache.end() && c->second.updated == j.updated) c->second.pending = false;
+    return true;
 }
 
 static void ResumeWorker() {
@@ -972,10 +978,16 @@ static void ResumeWorker() {
             g_resumeQueue.pop_front();
             g_resumeBusy = true;
         }
-        ProcessResumeJob(j);
+        bool ok = ProcessResumeJob(j);
         {
             std::lock_guard<std::mutex> lk(g_resumeQMtx);
             g_resumeBusy = false;
+            if (!ok) {  // keep it (newest per file) and write it after reconnecting
+                g_resumeFailed.erase(std::remove_if(g_resumeFailed.begin(), g_resumeFailed.end(),
+                                                    [&](const ResumeJob& f) { return f.path == j.path && f.file == j.file; }),
+                                     g_resumeFailed.end());
+                g_resumeFailed.push_back(j);
+            }
         }
         g_resumeQCv.notify_all();
     }
@@ -1015,6 +1027,39 @@ static void QueueResume(const std::string& path, double pos, double dur, bool re
         g_resumeQueue.push_back(j);
     }
     g_resumeQCv.notify_all();
+}
+
+// After (re)connecting: write the saves that failed while the connection was
+// down, and keep them visible to ResumePositionFor in the meantime.
+static void RequeueFailedResume() {
+    std::vector<ResumeJob> jobs;
+    {
+        std::lock_guard<std::mutex> lk(g_resumeQMtx);
+        for (auto it = g_resumeFailed.begin(); it != g_resumeFailed.end();) {
+            if (it->file == g_resumeFile) { jobs.push_back(*it); it = g_resumeFailed.erase(it); }
+            else ++it;
+        }
+    }
+    if (jobs.empty()) return;
+    {
+        std::lock_guard<std::mutex> lk(g_resumeMtx);
+        for (auto& j : jobs) {
+            auto it = g_resumeCache.find(j.path);
+            if (it != g_resumeCache.end() && it->second.updated > j.updated) continue;  // newer elsewhere
+            ResumeEntry& e = g_resumeCache[j.path];
+            e.pos = j.pos;
+            e.duration = j.duration;
+            e.updated = j.updated;
+            e.removed = j.remove;
+            e.pending = true;
+        }
+    }
+    {
+        std::lock_guard<std::mutex> lk(g_resumeQMtx);
+        for (auto& j : jobs) g_resumeQueue.push_back(j);
+    }
+    g_resumeQCv.notify_all();
+    AppLog("resume: retrying " + std::to_string(jobs.size()) + " save(s) from before the connection was lost");
 }
 
 // Re-reads the server file (positions saved by other devices) and merges it
@@ -1137,7 +1182,7 @@ static void HandleMpvEvents() {
             g_resumeCurPath.clear();
             if (e->reason == MPV_END_FILE_REASON_EOF) {
                 if (g_plIndex + 1 < (int)g_playlist.size()) PlayIndex(g_plIndex + 1);
-                else SetStatus(L"Finished");
+                else { SetStatus(L"Finished"); g_remotePlayIndex = -1; }
             } else if (e->reason == MPV_END_FILE_REASON_ERROR) {
                 std::wstring name = (g_plIndex >= 0 && g_plIndex < (int)g_playlist.size()) ? g_playlist[g_plIndex].name : L"";
                 SetStatus(L"Cannot play " + name + L": " + Utf8ToWide(g_mpv.error_string(e->error)));
@@ -1208,6 +1253,7 @@ static void PlayIndex(int i) {
     if (i < 0 || i >= (int)g_playlist.size()) return;
     g_plIndex = i;
     const PlayItem& it = g_playlist[i];
+    g_remotePlayIndex = it.remote ? i : -1;
     g_pendingSubs = it.subs;
     g_streamDuration = 0;  // unknown until mpv reports the new file's duration
     ResetKeyframeInterval();
@@ -1242,6 +1288,7 @@ static void PlayIndex(int i) {
 }
 
 static void StopPlayback() {
+    g_remotePlayIndex = -1;  // stopped on purpose: nothing to continue after a reconnect
     Cmd({"stop"});
     SetStatus(L"Stopped");
     SetWindowTextW(g_main, kAppName);
@@ -1515,10 +1562,8 @@ static bool NavigateRemote(const std::string& path, const std::wstring& selectNa
     bool ok = g_browseConn.list(path, real, items, err);
     SetCursor(old);
     if (!ok) {
-        if (!g_browseConn.isConnected()) {
-            g_connected = false;
-            SetConnStatus();
-        }
+        // A broken connection is reported by the "SSH connection reset" dialog
+        // (SshConn's lost callback -> WM_SSH_LOST).
         SetStatus(Utf8ToWide(err));
         UpdatePathBox();  // restore the current folder in the path box
         MessageBeep(MB_ICONWARNING);
@@ -1718,12 +1763,14 @@ static void NavigateTyped() {
 // ---------------------------------------------------------------------------
 // Connection
 // ---------------------------------------------------------------------------
-static void Disconnect() {
+// waitForSaves = false when the connection is already broken: the current
+// position is still queued, fails, and is written after reconnecting.
+static void Disconnect(bool waitForSaves = true) {
     // Write the current position before the connection goes away.
     ResumeSaveCurrent(false);
     g_resumeCurPath.clear();
     g_resumeLoadingPath.clear();
-    WaitResumeIdle(5000);
+    if (waitForSaves) WaitResumeIdle(5000);
     g_resumeEnabled = false;
     bool remotePlaying = g_plIndex >= 0 && g_plIndex < (int)g_playlist.size() && g_playlist[g_plIndex].remote;
     if (remotePlaying) StopPlayback();
@@ -1825,6 +1872,7 @@ static void Connect() {
     if (g_resumeEnabled) {
         g_resumeFile = JoinRemote(g_remoteHome, kResumeFileName);
         RefreshResumeCache();
+        RequeueFailedResume();
         std::lock_guard<std::mutex> lk(g_resumeMtx);
         AppLog("resume: using " + g_resumeFile + " (" + std::to_string(g_resumeCache.size()) + " saved positions)");
     } else {
@@ -1839,6 +1887,40 @@ static void Connect() {
 
     std::wstring last = IniGet(L"paths", g_connLabel.c_str());
     if (last.empty() || !NavigateRemote(WideToUtf8(last))) GoHome();
+}
+
+// ---------------------------------------------------------------------------
+// Lost connection
+// ---------------------------------------------------------------------------
+static bool g_lostDialogOpen = false;
+
+// An established SSH connection broke and the automatic reconnect failed.
+static void OnConnectionLost(const std::string& sshError) {
+    if (!g_connected || g_lostDialogOpen) return;  // already handled / user disconnected
+    g_lostDialogOpen = true;
+    // Remember what was playing so Retry can continue it.
+    // (mpv may already have given up on the file because its data stopped.)
+    int playing = (g_remotePlayIndex >= 0 && g_remotePlayIndex < (int)g_playlist.size() &&
+                   g_playlist[g_remotePlayIndex].remote) ? g_remotePlayIndex : -1;
+    std::wstring host = g_connLabel;
+    if (g_fullscreen) SetPropFlag("fullscreen", false);
+    ApplyFullscreen(false);
+    Disconnect(false);  // stop remote playback; do not wait for saves that cannot succeed now
+    SetStatus(L"SSH connection reset");
+
+    std::wstring text = L"SSH connection reset\n\nThe connection to " + host +
+                        L" was lost and could not be re-established.";
+    std::string e = sshError;
+    while (!e.empty() && (e.back() == '\n' || e.back() == '\r')) e.pop_back();
+    if (!e.empty()) text += L"\n\n" + Utf8ToWide(e);
+    text += playing >= 0 ? L"\n\nRetry reconnects and continues the video where it stopped."
+                         : L"\n\nRetry reconnects to the server.";
+    int answer = MessageBoxW(g_main, text.c_str(), L"SSH connection reset", MB_RETRYCANCEL | MB_ICONERROR);
+    if (answer == IDRETRY) {
+        Connect();  // shows its own message if the server is still unreachable
+        if (g_connected && playing >= 0 && playing < (int)g_playlist.size()) PlayIndex(playing);
+    }
+    g_lostDialogOpen = false;
 }
 
 // ---------------------------------------------------------------------------
@@ -2498,6 +2580,11 @@ static LRESULT CALLBACK MainProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             std::fabs(g_resumeCurPos - g_resumeLastSaved) >= 5.0)
             ResumeSaveCurrent(false);  // periodic save while playing
         return 0;
+    case WM_SSH_LOST: {
+        std::unique_ptr<std::string> e(reinterpret_cast<std::string*>(lp));
+        OnConnectionLost(e ? *e : std::string());
+        return 0;
+    }
     case WM_MPV_WAKEUP:
         HandleMpvEvents();
         return 0;
@@ -2646,6 +2733,10 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
     SetFocus(g_main);
 
     g_resumeThread = std::thread(ResumeWorker);
+    // Broken connections (either one) -> "SSH connection reset" dialog on the UI thread.
+    auto lost = [](const std::string& e) { PostMessageW(g_main, WM_SSH_LOST, 0, (LPARAM) new std::string(e)); };
+    g_browseConn.setLostCallback(lost);
+    g_streamConn.setLostCallback(lost);
     SetTimer(g_main, kResumeTimer, kResumeTimerMs, nullptr);
 
     MSG m;
