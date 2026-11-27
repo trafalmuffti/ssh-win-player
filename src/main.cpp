@@ -928,6 +928,8 @@ static bool InitMpv(std::string& err) {
     g_mpv.observe_property(g_mpvh, 0, "paused-for-cache", MPV_FORMAT_FLAG);
     g_mpv.observe_property(g_mpvh, 0, "cache-buffering-state", MPV_FORMAT_INT64);
     g_mpv.observe_property(g_mpvh, 0, "track-list", MPV_FORMAT_NODE);
+    g_mpv.observe_property(g_mpvh, 0, "sid", MPV_FORMAT_STRING);
+    g_mpv.observe_property(g_mpvh, 0, "aid", MPV_FORMAT_STRING);
     g_mpv.observe_property(g_mpvh, 0, "playlist-pos", MPV_FORMAT_INT64);
     g_mpv.observe_property(g_mpvh, 0, "playlist-count", MPV_FORMAT_INT64);
     g_mpv.observe_property(g_mpvh, 0, "file-size", MPV_FORMAT_INT64);
@@ -1001,6 +1003,8 @@ static void OnPictureType(const char* type) {
 // where the last one stopped.  Every save re-reads the server file and merges
 // (newest "updated" wins per file), so devices do not overwrite each other.
 // Windows servers are left alone.
+// The subtitle and audio track selected when a position is saved are stored
+// with it, so resuming a video also restores its track selection.
 // ---------------------------------------------------------------------------
 static const char* kResumeFileName = ".ssh-win-player-positions.xml";
 static const UINT_PTR kResumeTimer = 78;
@@ -1011,11 +1015,13 @@ static std::map<std::string, ResumeEntry> g_resumeCache;
 static std::string g_resumeFile;
 static std::string g_resumeLoadingPath, g_resumeCurPath;  // file being opened / playing
 static double g_resumeCurPos = 0, g_resumeCurDur = 0, g_resumeLastSaved = -1;
+static int g_resumeCurSid = kResumeTrackUnset, g_resumeCurAid = kResumeTrackUnset;  // current file's tracks
 static double g_resumeLoadingStart = 0;  // position the file being opened starts at
 
 struct ResumeJob {
     std::string file, path;
     double pos = 0, duration = 0;
+    int sid = kResumeTrackUnset, aid = kResumeTrackUnset;
     bool remove = false;
     int64_t updated = 0;
 };
@@ -1038,7 +1044,7 @@ static bool ProcessResumeJob(const ResumeJob& j) {
     }
     std::map<std::string, ResumeEntry> m;
     if (exists) ParseResumeXml(text, m);
-    ApplyResumeChange(m, j.path, j.pos, j.duration, j.remove, j.updated);
+    ApplyResumeChange(m, j.path, j.pos, j.duration, j.sid, j.aid, j.remove, j.updated);
     if (!g_browseConn.writeTextFile(j.file, BuildResumeXml(m), err)) {
         AppLog("resume: cannot write " + j.file + ": " + err);
         return false;
@@ -1085,13 +1091,15 @@ static bool WaitResumeIdle(DWORD ms) {
                                 [] { return g_resumeQueue.empty() && !g_resumeBusy; });
 }
 
-static void QueueResume(const std::string& path, double pos, double dur, bool remove) {
+static void QueueResume(const std::string& path, double pos, double dur, int sid, int aid, bool remove) {
     if (!g_resumeEnabled || path.empty()) return;
     ResumeJob j;
     j.file = g_resumeFile;
     j.path = path;
     j.pos = pos;
     j.duration = dur;
+    j.sid = sid;
+    j.aid = aid;
     j.remove = remove;
     j.updated = (int64_t)time(nullptr);
     {
@@ -1099,6 +1107,8 @@ static void QueueResume(const std::string& path, double pos, double dur, bool re
         ResumeEntry& e = g_resumeCache[path];
         e.pos = pos;
         e.duration = dur;
+        e.sid = sid;
+        e.aid = aid;
         e.updated = j.updated;
         e.removed = remove;
         e.pending = true;
@@ -1115,7 +1125,7 @@ static void QueueResume(const std::string& path, double pos, double dur, bool re
 }
 
 // After (re)connecting: write the saves that failed while the connection was
-// down, and keep them visible to ResumePositionFor in the meantime.
+// down, and keep them visible to ResumeLookupFor in the meantime.
 static void RequeueFailedResume() {
     std::vector<ResumeJob> jobs;
     {
@@ -1134,6 +1144,8 @@ static void RequeueFailedResume() {
             ResumeEntry& e = g_resumeCache[j.path];
             e.pos = j.pos;
             e.duration = j.duration;
+            e.sid = j.sid;
+            e.aid = j.aid;
             e.updated = j.updated;
             e.removed = j.remove;
             e.pending = true;
@@ -1162,12 +1174,28 @@ static void RefreshResumeCache() {
     g_resumeCache = MergePendingResume(std::move(server), g_resumeCache);
 }
 
-// Position to resume a remote file at (0 = from the start).
-static double ResumePositionFor(const std::string& path) {
-    if (!g_resumeEnabled) return 0;
+// The saved entry for a remote file: where it stopped and which subtitle /
+// audio tracks were selected.  False when nothing usable was saved.
+static bool ResumeLookupFor(const std::string& path, ResumeEntry& out) {
+    if (!g_resumeEnabled) return false;
     RefreshResumeCache();
     std::lock_guard<std::mutex> lk(g_resumeMtx);
-    return ResumeStartFor(g_resumeCache, path);
+    auto it = g_resumeCache.find(path);
+    if (it == g_resumeCache.end() || it->second.removed) return false;
+    out = it->second;
+    return true;
+}
+
+// mpv reports a track selection as the track id in text form, or "no".
+static int ParseTrackSelection(const char* v) {
+    if (!v || !*v) return kResumeTrackUnset;
+    if (strcmp(v, "no") == 0) return kResumeTrackOff;
+    return atoi(v);
+}
+
+// Text form of a stored track selection, for mpv commands and load options.
+static std::string TrackSelectionText(int v) {
+    return v == kResumeTrackOff ? "no" : std::to_string(v);
 }
 
 // Save the position of the playing remote file (finished = reached the end).
@@ -1175,7 +1203,7 @@ static void ResumeSaveCurrent(bool finished) {
     if (g_resumeCurPath.empty()) return;
     double pos = g_resumeCurPos, dur = g_resumeCurDur > 0 ? g_resumeCurDur : g_duration;
     bool remove = finished || ResumeShouldForget(pos, dur);
-    QueueResume(g_resumeCurPath, pos, dur, remove);
+    QueueResume(g_resumeCurPath, pos, dur, g_resumeCurSid, g_resumeCurAid, remove);
     g_resumeLastSaved = pos;
 }
 
@@ -1238,6 +1266,10 @@ static void HandleMpvEvents() {
                 ApplyBackBuffer();
             } else if (name == "track-list") {
                 ParseTrackList(p->format == MPV_FORMAT_NODE ? static_cast<mpv_node*>(p->data) : nullptr);
+            } else if (name == "sid") {
+                g_resumeCurSid = ParseTrackSelection(p->format == MPV_FORMAT_STRING ? *(char**)p->data : nullptr);
+            } else if (name == "aid") {
+                g_resumeCurAid = ParseTrackSelection(p->format == MPV_FORMAT_STRING ? *(char**)p->data : nullptr);
             } else if (name == "playlist-pos") {
                 g_mpvPlPos = p->format == MPV_FORMAT_INT64 ? *(int64_t*)p->data : -1;
             } else if (name == "playlist-count") {
@@ -1264,13 +1296,19 @@ static void HandleMpvEvents() {
                 std::string path = MpvString("path");
                 if (path.compare(0, 10, "archive://") == 0) {
                     g_resumeCurPath = g_playlist[g_remotePlayIndex].remotePath + "|/" + ArchiveEntryOf(path);
-                    double at = g_archiveFromStart ? 0 : ResumePositionFor(g_resumeCurPath);
+                    ResumeEntry saved;
+                    bool haveSaved = !g_archiveFromStart && ResumeLookupFor(g_resumeCurPath, saved);
+                    double at = haveSaved ? ResumeStartFor(saved) : 0;
                     g_resumeCurPos = g_resumeLastSaved = at;
                     if (at > 0) {
                         char b[32];
                         snprintf(b, sizeof(b), "%.3f", at);
                         Cmd({"seek", b, "absolute"});
                         SetStatus(L"Resuming at " + FormatTime(at) + L": " + Utf8ToWide(ArchiveEntryOf(path)));
+                    }
+                    if (haveSaved) {  // restore the subtitle / audio track chosen last time
+                        if (saved.sid != kResumeTrackUnset) Cmd({"set", "sid", TrackSelectionText(saved.sid)});
+                        if (saved.aid != kResumeTrackUnset) Cmd({"set", "aid", TrackSelectionText(saved.aid)});
                     }
                 }
             }
@@ -1371,6 +1409,7 @@ static void PlayIndex(int i) {
     ResetKeyframeInterval();
     g_resumeLoadingPath.clear();
     g_resumeLoadingStart = 0;
+    g_resumeCurSid = g_resumeCurAid = kResumeTrackUnset;  // the new file reports its own selection
     double resumeAt = 0;
     // Shift held (Shift+double-click / Shift+Enter): start from the beginning.
     bool fromStart = GetKeyState(VK_SHIFT) < 0;
@@ -1389,12 +1428,18 @@ static void PlayIndex(int i) {
         } else if (g_resumeEnabled) {
             opts += ",resume-playback=no";  // the server's shared position decides, not mpv's local one
             g_resumeLoadingPath = it.remotePath;
-            resumeAt = fromStart ? 0 : ResumePositionFor(it.remotePath);  // saved by this or another device
+            ResumeEntry saved;
+            bool haveSaved = !fromStart && ResumeLookupFor(it.remotePath, saved);  // saved by this or another device
+            resumeAt = haveSaved ? ResumeStartFor(saved) : 0;
             g_resumeLoadingStart = resumeAt;
             if (resumeAt > 0) {
                 char b[48];
                 snprintf(b, sizeof(b), ",start=%.3f", resumeAt);
                 opts += b;
+            }
+            if (haveSaved) {  // restore the subtitle / audio track chosen last time
+                if (saved.sid != kResumeTrackUnset) opts += ",sid=" + TrackSelectionText(saved.sid);
+                if (saved.aid != kResumeTrackUnset) opts += ",aid=" + TrackSelectionText(saved.aid);
             }
         }
         Cmd({"loadfile", it.url, "replace", "-1", opts});
