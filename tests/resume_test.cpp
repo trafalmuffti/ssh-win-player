@@ -40,17 +40,17 @@ int main() {
     // 3. Two devices: different files are both kept; for the same file the newest save wins.
     Map srv;
     srv["/a"] = E(100, 1000, 100);
-    ApplyResumeChange(srv, "/b", 50, 1000, false, 101);  // device 1 saves another file
+    ApplyResumeChange(srv, "/b", 50, 1000, kResumeTrackUnset, kResumeTrackUnset, false, 101);  // device 1 saves another file
     CHECK(srv.size() == 2);
-    ApplyResumeChange(srv, "/a", 30, 1000, false, 90);   // device 2's older save: ignored
+    ApplyResumeChange(srv, "/a", 30, 1000, kResumeTrackUnset, kResumeTrackUnset, false, 90);   // device 2's older save: ignored
     CHECK(std::fabs(srv["/a"].pos - 100) < 1e-9);
-    ApplyResumeChange(srv, "/a", 300, 1000, false, 110); // newer save: wins
+    ApplyResumeChange(srv, "/a", 300, 1000, kResumeTrackUnset, kResumeTrackUnset, false, 110); // newer save: wins
     CHECK(std::fabs(srv["/a"].pos - 300) < 1e-9 && srv["/a"].updated == 110);
 
     // 4. Removal (finished): newer removal deletes, older removal is ignored.
-    ApplyResumeChange(srv, "/b", 0, 0, true, 100);
+    ApplyResumeChange(srv, "/b", 0, 0, kResumeTrackUnset, kResumeTrackUnset, true, 100);
     CHECK(srv.count("/b") == 1);
-    ApplyResumeChange(srv, "/b", 0, 0, true, 120);
+    ApplyResumeChange(srv, "/b", 0, 0, kResumeTrackUnset, kResumeTrackUnset, true, 120);
     CHECK(srv.count("/b") == 0);
 
     // 5. Local saves not yet written override older server data; written ones do not linger.
@@ -96,6 +96,29 @@ int main() {
     ParseResumeXml("<positions><file path=\"/a\" pos=", g);
     ParseResumeXml("not xml at all", g);
     CHECK(g.empty());
+
+    // 9. Track selection round-trips: an id, an explicit "no", and absent.
+    Map tm;
+    ResumeEntry te = E(500, 1000, 300);
+    te.sid = 3;
+    te.aid = kResumeTrackOff;
+    tm["/movie.mkv"] = te;
+    tm["/plain.mp4"] = E(500, 1000, 200);  // no tracks recorded
+    std::string txml = BuildResumeXml(tm);
+    CHECK(txml.find("sid=\"3\"") != std::string::npos);
+    CHECK(txml.find("aid=\"no\"") != std::string::npos);
+    Map tback;
+    ParseResumeXml(txml, tback);
+    CHECK(tback["/movie.mkv"].sid == 3 && tback["/movie.mkv"].aid == kResumeTrackOff);
+    CHECK(tback["/plain.mp4"].sid == kResumeTrackUnset && tback["/plain.mp4"].aid == kResumeTrackUnset);
+    // An entry written before tracks were recorded parses as unset.
+    Map oldf;
+    ParseResumeXml("<file path=\"/old.mkv\" pos=\"7\" duration=\"9\" updated=\"5\"/>", oldf);
+    CHECK(oldf["/old.mkv"].sid == kResumeTrackUnset && oldf["/old.mkv"].aid == kResumeTrackUnset);
+    // A save carries its tracks through ApplyResumeChange.
+    Map am;
+    ApplyResumeChange(am, "/x.mkv", 10, 100, 2, kResumeTrackOff, false, 50);
+    CHECK(am["/x.mkv"].sid == 2 && am["/x.mkv"].aid == kResumeTrackOff);
 
     std::printf(g_fail ? "%d check(s) FAILED\n" : "all resume tests passed\n", g_fail);
     return g_fail ? 1 : 0;

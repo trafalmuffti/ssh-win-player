@@ -4,9 +4,12 @@
 // File (one <file> element per line, newest first):
 //   <?xml version="1.0" encoding="UTF-8"?>
 //   <positions version="1">
-//     <file path="/srv/movies/a.mkv" pos="754.120" duration="5400.000" updated="1763630000"/>
+//     <file path="/srv/movies/a.mkv" pos="754.120" duration="5400.000" updated="1763630000" sid="3" aid="no"/>
 //   </positions>
 // pos / duration in seconds, updated = unix time of the save.
+// sid / aid are optional: the mpv subtitle / audio track ids selected when the
+// position was saved, or "no" when the track was explicitly off.  Absent means
+// nothing was recorded (older file) and the player's own choice stands.
 #pragma once
 #include <algorithm>
 #include <cstdint>
@@ -19,6 +22,10 @@
 
 static const double kResumeMinPos = 5.0;       // stopped earlier than this: nothing to resume
 static const size_t kResumeMaxEntries = 1000;  // most recently updated files kept
+
+// Track selection stored in a ResumeEntry (mpv track ids).
+static const int kResumeTrackUnset = -2;  // nothing recorded: leave the player's choice alone
+static const int kResumeTrackOff = -1;    // explicitly off ("no")
 
 static void AppendUtf8(std::string& r, unsigned long cp) {
     if (cp < 0x80) r += (char)cp;
@@ -33,6 +40,7 @@ static void AppendUtf8(std::string& r, unsigned long cp) {
 
 struct ResumeEntry {
     double pos = 0, duration = 0;
+    int sid = kResumeTrackUnset, aid = kResumeTrackUnset;  // selected subtitle / audio track
     int64_t updated = 0;   // unix time of the save
     bool removed = false;  // local tombstone (finished / restarted), not written
     bool pending = false;  // local change not yet written to the server
@@ -90,9 +98,17 @@ static void ParseResumeXml(const std::string& text, std::map<std::string, Resume
         };
         std::string path = attr("path");
         if (!path.empty()) {
+            auto track = [&](const char* name) -> int {
+                std::string v = attr(name);
+                if (v.empty()) return kResumeTrackUnset;
+                if (v == "no") return kResumeTrackOff;
+                return (int)strtol(v.c_str(), nullptr, 10);
+            };
             ResumeEntry e;
             e.pos = strtod(attr("pos").c_str(), nullptr);
             e.duration = strtod(attr("duration").c_str(), nullptr);
+            e.sid = track("sid");
+            e.aid = track("aid");
             e.updated = strtoll(attr("updated").c_str(), nullptr, 10);
             out[path] = e;
         }
@@ -108,10 +124,15 @@ static std::string BuildResumeXml(const std::map<std::string, ResumeEntry>& m) {
                     "<!-- SSH Win Player: saved playback positions (seconds), shared by all devices. -->\n"
                     "<positions version=\"1\">\n";
     char num[128];
+    auto trackAttr = [](const char* name, int v) -> std::string {
+        if (v == kResumeTrackUnset) return "";
+        return std::string(" ") + name + "=\"" + (v == kResumeTrackOff ? "no" : std::to_string(v)) + "\"";
+    };
     for (auto& kv : v) {
-        snprintf(num, sizeof(num), "\" pos=\"%.3f\" duration=\"%.3f\" updated=\"%lld\"/>\n", kv.second.pos,
+        snprintf(num, sizeof(num), "\" pos=\"%.3f\" duration=\"%.3f\" updated=\"%lld\"", kv.second.pos,
                  kv.second.duration, (long long)kv.second.updated);
-        x += "  <file path=\"" + XmlEscape(kv.first) + num;
+        x += "  <file path=\"" + XmlEscape(kv.first) + num + trackAttr("sid", kv.second.sid) +
+             trackAttr("aid", kv.second.aid) + "/>\n";
     }
     x += "</positions>\n";
     return x;
@@ -126,13 +147,15 @@ static bool ResumeShouldForget(double pos, double dur) { return pos < kResumeMin
 // Applies one device's save to the map read from the server.  A newer save of
 // the same file by another device wins.
 static void ApplyResumeChange(std::map<std::string, ResumeEntry>& m, const std::string& path, double pos,
-                              double dur, bool remove, int64_t updated) {
+                              double dur, int sid, int aid, bool remove, int64_t updated) {
     auto it = m.find(path);
     if (it != m.end() && it->second.updated > updated) return;
     if (remove) { m.erase(path); return; }
     ResumeEntry e;
     e.pos = pos;
     e.duration = dur;
+    e.sid = sid;
+    e.aid = aid;
     e.updated = updated;
     m[path] = e;
 }
@@ -149,9 +172,13 @@ static std::map<std::string, ResumeEntry> MergePendingResume(std::map<std::strin
 }
 
 // Where to start a file (0 = from the beginning).
+static double ResumeStartFor(const ResumeEntry& e) {
+    if (e.removed) return 0;
+    if (ResumeShouldForget(e.pos, e.duration)) return 0;
+    return e.pos;
+}
 static double ResumeStartFor(const std::map<std::string, ResumeEntry>& m, const std::string& path) {
     auto it = m.find(path);
-    if (it == m.end() || it->second.removed) return 0;
-    if (ResumeShouldForget(it->second.pos, it->second.duration)) return 0;
-    return it->second.pos;
+    if (it == m.end()) return 0;
+    return ResumeStartFor(it->second);
 }
